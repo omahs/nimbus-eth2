@@ -347,6 +347,11 @@ $(TOOLS): | build deps
 		MAKE="$(MAKE)" V="$(V)" $(ENV_SCRIPT) scripts/compile_nim_program.sh $@ "$${TOOL_DIR}/$@.nim" $(NIM_PARAMS) && \
 		echo -e $(BUILD_END_MSG) "build/$@"
 
+ngui/ngui: | build deps
+	+ echo -e $(BUILD_MSG) "build/$@" && \
+		MAKE="$(MAKE)" V="$(V)" $(ENV_SCRIPT) scripts/compile_nim_program.sh $@ "ngui.ngui.nim" $(NIM_PARAMS) && \
+		echo -e $(BUILD_END_MSG) "ngui/ngui"
+
 clean_eth2_network_simulation_data:
 	rm -rf tests/simulation/data
 
