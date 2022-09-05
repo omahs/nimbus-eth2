@@ -263,66 +263,12 @@ proc createAndSendAttestation(node: BeaconNode,
 proc getBlockProposalEth1Data*(node: BeaconNode,
                                state: ForkedHashedBeaconState):
                                BlockProposalEth1Data =
-  if node.eth1Monitor.isNil:
-    let pendingDepositsCount =
-      getStateField(state, eth1_data).deposit_count -
-        getStateField(state, eth1_deposit_index)
-    if pendingDepositsCount > 0:
-      result.hasMissingDeposits = true
-    else:
-      result.vote = getStateField(state, eth1_data)
-  else:
-    let finalizedEpochRef = node.dag.getFinalizedEpochRef()
-    result = node.eth1Monitor.getBlockProposalData(
-      state, finalizedEpochRef.eth1_data,
-      finalizedEpochRef.eth1_deposit_index)
+  let finalizedEpochRef = node.dag.getFinalizedEpochRef()
+  result = node.elManager.getBlockProposalData(
+    state, finalizedEpochRef.eth1_data,
+    finalizedEpochRef.eth1_deposit_index)
 
 from web3/engine_api import ForkchoiceUpdatedResponse
-
-proc forkchoice_updated(
-    head_block_hash: Eth2Digest, safe_block_hash: Eth2Digest,
-    finalized_block_hash: Eth2Digest, timestamp: uint64, random: Eth2Digest,
-    fee_recipient: ethtypes.Address, execution_engine: Eth1Monitor):
-    Future[Option[bellatrix.PayloadID]] {.async.} =
-  logScope:
-    head_block_hash
-    finalized_block_hash
-
-  discard $capellaImplementationMissing & ": ensure fcU usage updated for capella"
-  let
-    forkchoiceResponse =
-      try:
-        awaitWithTimeout(
-          execution_engine.forkchoiceUpdated(
-            head_block_hash, safe_block_hash, finalized_block_hash,
-            timestamp, random.data, fee_recipient),
-          FORKCHOICEUPDATED_TIMEOUT):
-            error "Engine API fork-choice update timed out"
-            default(ForkchoiceUpdatedResponse)
-      except CatchableError as err:
-        error "Engine API fork-choice update failed", err = err.msg
-        default(ForkchoiceUpdatedResponse)
-
-    payloadId = forkchoiceResponse.payloadId
-
-  return if payloadId.isSome:
-    some(bellatrix.PayloadID(payloadId.get))
-  else:
-    none(bellatrix.PayloadID)
-
-proc get_execution_payload[EP](
-    payload_id: Option[bellatrix.PayloadID], execution_engine: Eth1Monitor):
-    Future[EP] {.async.} =
-  return if payload_id.isNone():
-    # Pre-merge, empty payload
-    default(EP)
-  else:
-    when EP is bellatrix.ExecutionPayload:
-      asConsensusExecutionPayload(
-        await execution_engine.getPayload(payload_id.get))
-    else:
-      debugRaiseAssert $capellaImplementationMissing & ": implement getPayload V2"
-      default(EP)
 
 proc getFeeRecipient(node: BeaconNode,
                      pubkey: ValidatorPubKey,
@@ -334,7 +280,8 @@ from web3/engine_api_types import PayloadExecutionStatus
 from ../spec/datatypes/capella import BeaconBlock, ExecutionPayload
 from ../spec/datatypes/eip4844 import BeaconBlock, ExecutionPayload
 
-proc getExecutionPayload[T](
+proc getExecutionPayload(
+    T: type,
     node: BeaconNode, proposalState: ref ForkedHashedBeaconState,
     epoch: Epoch, validator_index: ValidatorIndex): Future[Opt[T]] {.async.} =
   # https://github.com/ethereum/consensus-specs/blob/v1.1.10/specs/bellatrix/validator.md#executionpayload
@@ -364,74 +311,41 @@ proc getExecutionPayload[T](
       else:
         default(T)
 
-  if node.eth1Monitor.isNil:
-    beacon_block_payload_errors.inc()
-    warn "getExecutionPayload: eth1Monitor not initialized; using empty execution payload"
-    return Opt.some empty_execution_payload
-
   try:
-    # Minimize window for Eth1 monitor to shut down connection
-    await node.consensusManager.eth1Monitor.ensureDataProvider()
-
-    # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.1/src/engine/specification.md#request-2
-    const GETPAYLOAD_TIMEOUT = 1.seconds
-
     let
       beaconHead = node.attestationPool[].getBeaconHead(node.dag.head)
       executionBlockRoot = node.dag.loadExecutionBlockRoot(beaconHead.blck)
       latestHead =
         if not executionBlockRoot.isZero:
           executionBlockRoot
-        elif node.eth1Monitor.terminalBlockHash.isSome:
-          node.eth1Monitor.terminalBlockHash.get.asEth2Digest
+        elif node.elManager.terminalBlockHash.isSome:
+          node.elManager.terminalBlockHash.get.asEth2Digest
         else:
           default(Eth2Digest)
       latestSafe = beaconHead.safeExecutionPayloadHash
       latestFinalized = beaconHead.finalizedExecutionPayloadHash
-      lastFcU = node.consensusManager.forkchoiceUpdatedInfo
       timestamp = withState(proposalState[]):
         compute_timestamp_at_slot(forkyState.data, forkyState.data.slot)
-      payload_id =
-        if  lastFcU.isSome and
-            lastFcU.get.headBlockRoot == latestHead and
-            lastFcU.get.safeBlockRoot == latestSafe and
-            lastFcU.get.finalizedBlockRoot == latestFinalized and
-            lastFcU.get.timestamp == timestamp and
-            lastFcU.get.feeRecipient == feeRecipient:
-          some bellatrix.PayloadID(lastFcU.get.payloadId)
-        else:
-          debug "getExecutionPayload: didn't find payloadId, re-querying",
-            latestHead, latestSafe, latestFinalized,
-            timestamp,
-            feeRecipient,
-            cachedForkchoiceUpdateInformation = lastFcU
+      random = withState(proposalState[]):
+        get_randao_mix(forkyState.data, get_current_epoch(forkyState.data))
+      withdrawals = newSeq[Withdrawal]() # TODO This should not be empty in the future
+      payload = await node.elManager.getPayload(
+        EngineApiPayloadType(T), latestHead, latestSafe, latestFinalized,
+        timestamp, random, feeRecipient, withdrawals)
 
-          let random = withState(proposalState[]):
-            get_randao_mix(forkyState.data, get_current_epoch(forkyState.data))
-          (await forkchoice_updated(
-           latestHead, latestSafe, latestFinalized, timestamp, random,
-           feeRecipient, node.consensusManager.eth1Monitor))
-      payload = try:
-        awaitWithTimeout(
-          get_execution_payload[T](payload_id, node.consensusManager.eth1Monitor),
-          GETPAYLOAD_TIMEOUT):
-            beacon_block_payload_errors.inc()
-            warn "Getting execution payload from Engine API timed out", payload_id
-            empty_execution_payload
-      except CatchableError as err:
-        beacon_block_payload_errors.inc()
-        warn "Getting execution payload from Engine API failed",
-              payload_id, err = err.msg
-        empty_execution_payload
+    if payload.isNone:
+      error "Failed to obtain from EL"
+      return Opt.none(T)
 
-    return Opt.some payload
+    return Opt.some asConsensusExecutionPayload(payload.get)
   except CatchableError as err:
     beacon_block_payload_errors.inc()
     error "Error creating non-empty execution payload; using empty execution payload",
       msg = err.msg
     return Opt.some empty_execution_payload
 
-proc makeBeaconBlockForHeadAndSlot*[EP](
+proc makeBeaconBlockForHeadAndSlot*(
+    EP: type,
     node: BeaconNode, randao_reveal: ValidatorSig,
     validator_index: ValidatorIndex, graffiti: GraffitiBytes, head: BlockRef,
     slot: Slot,
@@ -464,15 +378,14 @@ proc makeBeaconBlockForHeadAndSlot*[EP](
       elif slot.epoch < node.dag.cfg.BELLATRIX_FORK_EPOCH or
             not (
               is_merge_transition_complete(state[]) or
-              ((not node.eth1Monitor.isNil) and node.eth1Monitor.ttdReached)):
+              node.elManager.ttdReached):
         let fut = newFuture[Opt[EP]]("empty-payload")
         # https://github.com/nim-lang/Nim/issues/19802
         fut.complete(Opt.some(default(EP)))
         fut
       else:
         # Create execution payload while packing attestations
-        getExecutionPayload[EP](
-          node, state, slot.epoch, validator_index)
+        getExecutionPayload(EP, node, state, slot.epoch, validator_index)
 
     eth1Proposal = node.getBlockProposalEth1Data(state[])
 
@@ -525,13 +438,13 @@ proc makeBeaconBlockForHeadAndSlot*[EP](
 
 # workaround for https://github.com/nim-lang/Nim/issues/20900 to avoid default
 # parameters
-proc makeBeaconBlockForHeadAndSlot*[EP](
-    node: BeaconNode, randao_reveal: ValidatorSig,
+proc makeBeaconBlockForHeadAndSlot*(
+    EP: type, node: BeaconNode, randao_reveal: ValidatorSig,
     validator_index: ValidatorIndex, graffiti: GraffitiBytes, head: BlockRef,
     slot: Slot):
-    Future[ForkedBlockResult] =
-  return makeBeaconBlockForHeadAndSlot[EP](
-    node, randao_reveal, validator_index, graffiti, head, slot,
+    Future[ForkedBlockResult] {.async.} =
+  return await makeBeaconBlockForHeadAndSlot(
+    EP, node, randao_reveal, validator_index, graffiti, head, slot,
     execution_payload = Opt.none(EP),
     transactions_root = Opt.none(Eth2Digest),
     execution_payload_root = Opt.none(Eth2Digest))
@@ -681,7 +594,8 @@ proc getBlindedBlockParts(
     shimExecutionPayload, executionPayloadHeader.get,
     getFieldNames(bellatrix.ExecutionPayloadHeader))
 
-  let newBlock = await makeBeaconBlockForHeadAndSlot[bellatrix.ExecutionPayload](
+  let newBlock = await makeBeaconBlockForHeadAndSlot(
+    bellatrix.ExecutionPayload,
     node, randao, validator_index, graffiti, head, slot,
     execution_payload = Opt.some shimExecutionPayload,
     transactions_root = Opt.some executionPayloadHeader.get.transactions_root,
@@ -832,10 +746,12 @@ proc proposeBlock(node: BeaconNode,
 
   let newBlock =
     if slot.epoch >= node.dag.cfg.CAPELLA_FORK_EPOCH:
-      await makeBeaconBlockForHeadAndSlot[capella.ExecutionPayload](
+      await makeBeaconBlockForHeadAndSlot(
+        capella.ExecutionPayload,
         node, randao, validator_index, node.graffitiBytes, head, slot)
     else:
-      await makeBeaconBlockForHeadAndSlot[bellatrix.ExecutionPayload](
+      await makeBeaconBlockForHeadAndSlot(
+        bellatrix.ExecutionPayload,
         node, randao, validator_index, node.graffitiBytes, head, slot)
 
   if newBlock.isErr():

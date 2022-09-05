@@ -374,8 +374,9 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
           return RestApiResponse.jsonError(Http400, InvalidRandaoRevealValue)
 
         let res =
-          await makeBeaconBlockForHeadAndSlot[bellatrix.ExecutionPayload](
-            node, qrandao, proposer.get(), qgraffiti, qhead, qslot)
+          await makeBeaconBlockForHeadAndSlot(
+            bellatrix.ExecutionPayload, node, qrandao, proposer.get(),
+            qgraffiti, qhead, qslot)
         if res.isErr():
           return RestApiResponse.jsonError(Http400, res.error())
         res.get()
@@ -477,8 +478,9 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
         bellatrixData: res.get()))
     else:
       # Pre-Bellatrix, this endpoint will return a BeaconBlock
-      let res = await makeBeaconBlockForHeadAndSlot[bellatrix.ExecutionPayload](
-        node, qrandao, proposer.get(), qgraffiti, qhead, qslot)
+      let res = await makeBeaconBlockForHeadAndSlot(
+        bellatrix.ExecutionPayload, node, qrandao,
+        proposer.get(), qgraffiti, qhead, qslot)
       if res.isErr():
         return RestApiResponse.jsonError(Http400, res.error())
       return responsePlain(res.get())

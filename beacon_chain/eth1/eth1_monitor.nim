@@ -15,6 +15,7 @@ import
        typetraits, uri, json],
   # Nimble packages:
   chronos, metrics, chronicles/timings, stint/endians2,
+  json_rpc/client,
   web3, web3/ethtypes as web3Types, web3/ethhexstrings, web3/engine_api,
   eth/common/eth_types,
   eth/async_utils, stew/[byteutils, objects, results, shims/hashes],
@@ -23,14 +24,14 @@ import
   ../spec/datatypes/[base, phase0, bellatrix],
   ../networking/network_metadata,
   ../consensus_object_pools/block_pools_types,
-  ".."/[beacon_chain_db, beacon_node_status, beacon_clock],
-  ./merkle_minimal
+  ".."/[beacon_chain_db, beacon_node_status, beacon_clock, future_combinators],
+  "."/[merkle_minimal, el_conf]
 
 from std/times import getTime, inSeconds, initTime, `-`
 from ../spec/engine_authentication import getSignedIatToken
 
 export
-  web3Types, deques, base, DepositTreeSnapshot
+  el_conf, web3Types, deques, base, DepositTreeSnapshot
 
 logScope:
   topics = "eth1"
@@ -57,11 +58,17 @@ contract(DepositContract):
                     index: Int64LeBytes) {.event.}
 
 const
-  web3Timeouts = 60.seconds
   hasDepositRootChecks = defined(has_deposit_root_checks)
   hasGenesisDetection* = defined(has_genesis_detection)
 
   targetBlocksPerLogsRequest = 5000'u64  # This is roughly a day of Eth1 blocks
+
+  # Engine API timeouts
+  engineApiConnectionTimeout = 5.seconds  # How much we wait before giving up connecting to the Engine API
+  web3RequestsTimeout* = 8.seconds # How much we wait for eth_* requests (e.g. eth_getBlockByHash)
+
+  # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.1/src/engine/specification.md#request-2
+  GETPAYLOAD_TIMEOUT = 1.seconds
 
 type
   Eth1BlockNumber* = uint64
@@ -109,39 +116,56 @@ type
     hasConsensusViolation: bool
       ## The local chain contradicts the observed consensus on the network
 
-  Eth1MonitorState = enum
-    Initialized
-    Started
-    ReadyToRestartToPrimary
-    Failed
-    Stopping
-    Stopped
+  NextExpectedPayloadParams* = object
+    headBlockRoot*: Eth2Digest
+    safeBlockRoot*: Eth2Digest
+    finalizedBlockRoot*: Eth2Digest
+    payloadAttributes: PayloadAttributesV1
 
-  Eth1Monitor* = ref object
-    state: Eth1MonitorState
-    startIdx: int
-    web3Urls: seq[string]
+  ELManager* = ref object
     eth1Network: Option[Eth1Network]
+      ## If this value is supplied the EL monitor will check whether
+      ## all configured EL nodes are connected to the same network.
+
+    getBeaconTime: GetBeaconTimeFn
+      ## The current beacon time is used for deciding when to active
+      ## the TTD monitoring and the transition configuration exchange.
+      ## TODO We may be able to remove these features once the Gnosis
+      ##      network has transitionsed through the merge in Dec 2023.
+
     depositContractAddress*: Eth1Address
-    depositContractDeployedAt: BlockHashOrNumber
-    forcePolling: bool
-    jwtSecret: Option[seq[byte]]
+    depositContractBlockNumber: uint64
+    depositContractBlockHash: BlockHash
+
     blocksPerLogsRequest: uint64
+      ## This value is used to dynamically adjust the number of
+      ## blocks we are trying to download at once during deposit
+      ## syncing. By default, the value is set to the constant
+      ## `targetBlocksPerLogsRequest`, but if the EL is failing
+      ## to serve this number of blocks per single `eth_getLogs`
+      ## request, we temporarily lower the value until the request
+      ## succeeds. The failures are generally expected only in
+      ## periods in the history for very high deposit density.
 
-    dataProvider: Web3DataProviderRef
-    latestEth1Block: Option[FullBlockId]
+    elConnections: seq[ELConnection]
+      ## All active EL connections
 
-    depositsChain: Eth1Chain
-    eth1Progress: AsyncEvent
+    depositSyncConnectionIdx: int
+      ## The current connection used for deposit syncing
 
-    exchangedConfiguration*: bool
+    eth1Chain: Eth1Chain
+      ##
+
+    syncTargetBlock: Option[Eth1BlockNumber]
     terminalBlockHash*: Option[BlockHash]
 
-    runFut: Future[void]
+    chainSyncingLoopFut: Future[void]
+    exchangeTransitionConfigurationLoopFut: Future[void]
     stopFut: Future[void]
-    getBeaconTime: GetBeaconTimeFn
 
     ttdReachedField: bool
+
+    nextExpectedPayloadParams*: Option[NextExpectedPayloadParams]
 
     when hasGenesisDetection:
       genesisValidators: seq[ImmutableValidatorData]
@@ -149,13 +173,36 @@ type
       genesisState: GenesisStateRef
       genesisStateFut: Future[void]
 
-  Web3DataProvider* = object
-    url: string
-    web3: Web3
-    ns: Sender[DepositContract]
-    blockHeadersSubscription: Subscription
+  EtcStatus {.pure.} = enum
+    notExchangedYet
+    exchangeError
+    mismatch
+    match
 
-  Web3DataProviderRef* = ref Web3DataProvider
+  DepositContractSyncStatus {.pure.} = enum
+    unknown
+    notSynced
+    synced
+
+  ELConnection* = ref object
+    engineUrl: EngineApiUrl
+
+    web3: Option[Web3]
+      ## This will be `none` before connecting and while we are
+      ## reconnecting after a lost connetion. You can wait on
+      ## the future below for the moment the connection is active.
+
+    connectingFut: Future[Result[Web3, string]]
+      ## This future will be replaced when the connection is lost.
+
+    etcStatus: EtcStatus
+      ## The latest status of the `exchangeTransitionConfiguration`
+      ## exchange.
+
+    depositContractSyncStatus: DepositContractSyncStatus
+      ## Are we sure that this EL has synced the deposit contract?
+
+    lastPayloadId: Option[engine_api.PayloadID]
 
   FullBlockId* = object
     number: Eth1BlockNumber
@@ -198,44 +245,76 @@ declareGauge eth1_finalized_deposits,
 declareGauge eth1_chain_len,
   "The length of the in-memory chain of Eth1 blocks"
 
-func ttdReached*(m: Eth1Monitor): bool =
+declareCounter engine_newPayload_failures,
+  "Number of failed requests to the newPayload Engine API end-point", labels = ["url"]
+
+declareCounter engine_newPayload_sent,
+  "Number of successful requests to the newPayload Engine API end-point",
+  labels = ["url", "status"]
+
+declareCounter engine_forkchoiceUpdated_failures,
+  "Number of failed requests to the forkchoiceUpdated Engine API end-point", labels = ["url"]
+
+declareCounter engine_forkchoiceUpdated_sent,
+  "Number of successful requests to the forkchoiceUpdated Engine API end-point",
+  labels = ["url", "status"]
+
+template awaitOrRaiseOnTimeout[T](fut: Future[T],
+                                  timeout: Duration): T =
+  awaitWithTimeout(fut, timeout):
+    raise newException(DataProviderTimeout, "Timeout")
+
+func ttdReached*(m: ELManager): bool =
   m.ttdReachedField
 
-template cfg(m: Eth1Monitor): auto =
-  m.depositsChain.cfg
+template cfg(m: ELManager): auto =
+  m.eth1Chain.cfg
+
+template db(m: ELManager): BeaconChainDB =
+  m.eth1Chain.db
+
+func hasJwtSecret*(m: ELManager): bool =
+  for c in m.elConnections:
+    if c.engineUrl.jwtSecret.isSome:
+      return true
+
+func isSynced*(m: ELManager): bool =
+  m.syncTargetBlock.isSome and
+  m.eth1Chain.blocks.len > 0 and
+  m.syncTargetBlock.get <= m.eth1Chain.blocks[^1].number
 
 when hasGenesisDetection:
   import ../spec/[beaconstate, signatures]
 
-  template hasEnoughValidators(m: Eth1Monitor, blk: Eth1Block): bool =
+  template hasEnoughValidators(m: ELManager, blk: Eth1Block): bool =
     blk.activeValidatorsCount >= m.cfg.MIN_GENESIS_ACTIVE_VALIDATOR_COUNT
 
-  func chainHasEnoughValidators(m: Eth1Monitor): bool =
-    m.depositsChain.blocks.len > 0 and m.hasEnoughValidators(m.depositsChain.blocks[^1])
+  func chainHasEnoughValidators(m: ELManager): bool =
+    m.eth1Chain.blocks.len > 0 and m.hasEnoughValidators(m.eth1Chain.blocks[^1])
 
-  func isAfterMinGenesisTime(m: Eth1Monitor, blk: Eth1Block): bool =
+  func isAfterMinGenesisTime(m: ELManager, blk: Eth1Block): bool =
     doAssert blk.timestamp != 0
     let t = genesis_time_from_eth1_timestamp(m.cfg, uint64 blk.timestamp)
     t >= m.cfg.MIN_GENESIS_TIME
 
-  func isGenesisCandidate(m: Eth1Monitor, blk: Eth1Block): bool =
+  func isGenesisCandidate(m: ELManager, blk: Eth1Block): bool =
     m.hasEnoughValidators(blk) and m.isAfterMinGenesisTime(blk)
 
-  proc findGenesisBlockInRange(m: Eth1Monitor, startBlock, endBlock: Eth1Block):
+  proc findGenesisBlockInRange(m: ELManager, startBlock, endBlock: Eth1Block):
                                Future[Eth1Block] {.gcsafe.}
 
-  proc signalGenesis(m: Eth1Monitor, genesisState: GenesisStateRef) =
+  proc signalGenesis(m: ELManager, genesisState: GenesisStateRef) =
     m.genesisState = genesisState
 
     if not m.genesisStateFut.isNil:
       m.genesisStateFut.complete()
       m.genesisStateFut = nil
 
-  func allGenesisDepositsUpTo(m: Eth1Monitor, totalDeposits: uint64): seq[DepositData] =
+  func allGenesisDepositsUpTo(m: ELManager, totalDeposits: uint64): seq[DepositData] =
     for i in 0 ..< int64(totalDeposits):
-      result.add m.depositsChain.db.genesisDeposits.get(i)
+      result.add m.db.genesisDeposits.get(i)
 
-  proc createGenesisState(m: Eth1Monitor, eth1Block: Eth1Block): GenesisStateRef =
+  proc createGenesisState(m: ELManager, eth1Block: Eth1Block): GenesisStateRef =
     notice "Generating genesis state",
       blockNum = eth1Block.number,
       blockHash = eth1Block.hash,
@@ -254,7 +333,7 @@ when hasGenesisDetection:
     if eth1Block.activeValidatorsCount != 0:
       doAssert result.validators.lenu64 == eth1Block.activeValidatorsCount
 
-  proc produceDerivedData(m: Eth1Monitor, deposit: DepositData) =
+  proc produceDerivedData(m: ELManager, deposit: DepositData) =
     let htr = hash_tree_root(deposit)
 
     if verify_deposit_signature(m.cfg, deposit):
@@ -266,27 +345,18 @@ when hasGenesisDetection:
           withdrawal_credentials: deposit.withdrawal_credentials)
         m.genesisValidatorKeyToIndex[pubkey] = idx
 
-  proc processGenesisDeposit*(m: Eth1Monitor, newDeposit: DepositData) =
-    m.depositsChain.db.genesisDeposits.add newDeposit
+  proc processGenesisDeposit*(m: ELManager, newDeposit: DepositData) =
+    m.db.genesisDeposits.add newDeposit
     m.produceDerivedData(newDeposit)
 
-template depositChainBlocks*(m: Eth1Monitor): Deque[Eth1Block] =
-  m.depositsChain.blocks
+template eth1ChainBlocks*(m: ELManager): Deque[Eth1Block] =
+  m.eth1Chain.blocks
 
-template finalizedDepositsMerkleizer(m: Eth1Monitor): auto =
-  m.depositsChain.finalizedDepositsMerkleizer
+template finalizedDepositsMerkleizer(m: ELManager): auto =
+  m.eth1Chain.finalizedDepositsMerkleizer
 
-template headMerkleizer(m: Eth1Monitor): auto =
-  m.depositsChain.headMerkleizer
-
-proc fixupWeb3Urls*(web3Url: var string) =
-  var normalizedUrl = toLowerAscii(web3Url)
-  if not (normalizedUrl.startsWith("https://") or
-          normalizedUrl.startsWith("http://") or
-          normalizedUrl.startsWith("wss://") or
-          normalizedUrl.startsWith("ws://")):
-    warn "The Web3 URL does not specify a protocol. Assuming a WebSocket server", web3Url
-    web3Url = "ws://" & web3Url
+template headMerkleizer(m: ELManager): auto =
+  m.eth1Chain.headMerkleizer
 
 template toGaugeValue(x: Quantity): int64 =
   toGaugeValue(distinctBase x)
@@ -349,6 +419,7 @@ func asConsensusExecutionPayload*(rpcExecutionPayload: ExecutionPayloadV1):
       mapIt(rpcExecutionPayload.transactions, it.getTransaction)))
 
 from ../spec/datatypes/capella import ExecutionPayload, Withdrawal
+from ../spec/datatypes/eip4844 import ExecutionPayload
 
 func asConsensusExecutionPayload*(rpcExecutionPayload: ExecutionPayloadV2):
     capella.ExecutionPayload =
@@ -406,17 +477,17 @@ func asEngineExecutionPayload*(executionPayload: bellatrix.ExecutionPayload):
     blockHash: executionPayload.block_hash.asBlockHash,
     transactions: mapIt(executionPayload.transactions, it.getTypedTransaction))
 
-func asEngineExecutionPayload*(executionPayload: capella.ExecutionPayload):
-    ExecutionPayloadV2 =
-  template getTypedTransaction(tt: bellatrix.Transaction): TypedTransaction =
-    TypedTransaction(tt.distinctBase)
-  template getEngineWithdrawal(w: capella.Withdrawal): WithdrawalV1 =
+template toEngineWithdrawal(w: capella.Withdrawal): WithdrawalV1 =
     WithdrawalV1(
       index: Quantity(w.index),
       validatorIndex: Quantity(w.validator_index),
       address: Address(w.address.data),
       amount: w.amount.u256 * weiInGwei)
 
+func asEngineExecutionPayload*(executionPayload: capella.ExecutionPayload | eip4844.ExecutionPayload):
+    ExecutionPayloadV2 =
+  template getTypedTransaction(tt: bellatrix.Transaction): TypedTransaction =
+    TypedTransaction(tt.distinctBase)
   engine_api.ExecutionPayloadV2(
     parentHash: executionPayload.parent_hash.asBlockHash,
     feeRecipient: Address(executionPayload.fee_recipient.data),
@@ -434,7 +505,7 @@ func asEngineExecutionPayload*(executionPayload: capella.ExecutionPayload):
     baseFeePerGas: executionPayload.base_fee_per_gas,
     blockHash: executionPayload.block_hash.asBlockHash,
     transactions: mapIt(executionPayload.transactions, it.getTypedTransaction),
-    withdrawals: mapIt(executionPayload.withdrawals, it.getEngineWithdrawal))
+    withdrawals: mapIt(executionPayload.withdrawals, it.toEngineWithdrawal))
 
 func shortLog*(b: Eth1Block): string =
   try:
@@ -489,197 +560,514 @@ func toVoteData(blk: Eth1Block): Eth1Data =
 func hash*(x: Eth1Data): Hash =
   hash(x.block_hash)
 
-template awaitWithRetries*[T](lazyFutExpr: Future[T],
-                              retries = 3,
-                              timeout = web3Timeouts): untyped =
-  const
-    reqType = astToStr(lazyFutExpr)
-  var
-    retryDelayMs = 16000
-    f: Future[T]
-    attempts = 0
+proc close(connection: ELConnection): Future[void] {.async.} =
+  if connection.web3.isSome:
+    awaitWithTimeout(connection.web3.get.close(), 30.seconds):
+      debug "Failed to close data provider in time"
 
-  while true:
-    f = lazyFutExpr
-    yield f or sleepAsync(timeout)
-    if not f.finished:
-      await cancelAndWait(f)
-    elif f.failed:
-      when not (f.error of CatchableError):
-        static: doAssert false, "f.error not CatchableError"
-      debug "Web3 request failed", req = reqType, err = f.error.msg
-      inc failed_web3_requests
+proc isConnected(connection: ELConnection): bool =
+  connection.web3.isSome
+
+proc getJsonRpcRequestHeaders(jwtSecret: Option[seq[byte]]):
+    auto =
+  if jwtSecret.isSome:
+    let secret = jwtSecret.get
+    (proc(): seq[(string, string)] =
+      # https://www.rfc-editor.org/rfc/rfc6750#section-6.1.1
+      @[("Authorization", "Bearer " & getSignedIatToken(
+        secret, (getTime() - initTime(0, 0)).inSeconds))])
+  else:
+    (proc(): seq[(string, string)] = @[])
+
+proc newWeb3*(engineUrl: EngineApiUrl): Future[Web3] =
+  newWeb3(engineUrl.url, getJsonRpcRequestHeaders(engineUrl.jwtSecret))
+
+proc establishEngineApiConnection*(url: EngineApiUrl):
+                                   Future[Result[Web3, string]] {.async.} =
+  let web3Fut = newWeb3(url)
+  yield web3Fut or sleepAsync(engineApiConnectionTimeout)
+
+  if (not web3Fut.finished) or web3Fut.failed:
+    await cancelAndWait(web3Fut)
+    if web3Fut.failed:
+      return err "Failed to setup Engine API connection: " & web3Fut.readError.msg
     else:
-      break
+      return err "Failed to setup Engine API connection"
+  else:
+    return ok web3Fut.read
 
-    inc attempts
-    if attempts >= retries:
-      var errorMsg = reqType & " failed " & $retries & " times"
-      if f.failed: errorMsg &= ". Last error: " & f.error.msg
-      raise newException(DataProviderFailure, errorMsg)
+proc tryConnecting(connection: ELConnection): Future[bool] {.async.} =
+  if connection.isConnected:
+    return true
 
-    await sleepAsync(chronos.milliseconds(retryDelayMs))
-    retryDelayMs *= 2
+  if connection.connectingFut == nil:
+    connection.connectingFut = establishEngineApiConnection(connection.engineUrl)
 
-  read(f)
+  let web3Res = await connection.connectingFut
+  if web3Res.isErr:
+    return false
+  else:
+    connection.web3 = some web3Res.get
+    return true
 
-proc close(p: Web3DataProviderRef): Future[void] {.async.} =
-  if p.blockHeadersSubscription != nil:
-    try:
-      awaitWithRetries(p.blockHeadersSubscription.unsubscribe())
-    except CatchableError:
-      debug "Failed to clean up block headers subscription properly"
+proc connectedRpcClient(connection: ELConnection): Future[RpcClient] {.async.} =
+  while not connection.isConnected:
+    if not await connection.tryConnecting():
+      await sleepAsync(chronos.seconds(10))
 
-  awaitWithTimeout(p.web3.close(), 30.seconds):
-    debug "Failed to close data provider in time"
+  return connection.web3.get.provider
 
-proc getBlockByHash(p: Web3DataProviderRef, hash: BlockHash):
-                    Future[BlockObject] =
-  return p.web3.provider.eth_getBlockByHash(hash, false)
+proc getBlockByHash(rpcClient: RpcClient, hash: BlockHash): Future[BlockObject] =
+  rpcClient.eth_getBlockByHash(hash, false)
 
-proc getBlockByNumber*(p: Web3DataProviderRef,
+proc getBlockByNumber*(rpcClient: RpcClient,
                        number: Eth1BlockNumber): Future[BlockObject] =
-  let hexNumber = try: &"0x{number:X}" # No leading 0's!
-  except ValueError as exc: raiseAssert exc.msg # Never fails
-  p.web3.provider.eth_getBlockByNumber(hexNumber, false)
+  let hexNumber = try:
+    &"0x{number:X}" # No leading 0's!
+  except ValueError as exc:
+    # Since the format above is valid, failing here should not be possible
+    raiseAssert exc.msg
 
-proc getPayload*(p: Eth1Monitor,
-                 payloadId: bellatrix.PayloadID): Future[engine_api.ExecutionPayloadV1] =
-  # Eth1 monitor can recycle connections without (external) warning; at least,
-  # don't crash.
-  if p.isNil or p.dataProvider.isNil:
-    let epr = newFuture[engine_api.ExecutionPayloadV1]("getPayload")
-    epr.complete(default(engine_api.ExecutionPayloadV1))
-    return epr
+  rpcClient.eth_getBlockByNumber(hexNumber, false)
 
-  p.dataProvider.web3.provider.engine_getPayloadV1(FixedBytes[8] payloadId)
+proc getBlock(rpcClient: RpcClient, id: BlockHashOrNumber): Future[BlockObject] =
+  if id.isHash:
+    let hash = id.hash.asBlockHash()
+    return rpcClient.getBlockByHash(hash)
+  else:
+    return rpcClient.getBlockByNumber(id.number)
 
-proc newPayload*(p: Eth1Monitor, payload: engine_api.ExecutionPayloadV1):
-    Future[PayloadStatusV1] =
-  # Eth1 monitor can recycle connections without (external) warning; at least,
-  # don't crash.
-  if p.dataProvider.isNil:
-    let epr = newFuture[PayloadStatusV1]("newPayload")
-    epr.complete(PayloadStatusV1(status: PayloadExecutionStatus.syncing))
-    return epr
+func areSameAs(expectedParams: Option[NextExpectedPayloadParams],
+               latestHead, latestSafe, latestFinalized: Eth2Digest,
+               timestamp: uint64, feeRecipient: Eth1Address): bool =
+  expectedParams.isSome and
+  expectedParams.get.headBlockRoot == latestHead and
+  expectedParams.get.safeBlockRoot == latestSafe and
+  expectedParams.get.finalizedBlockRoot == latestFinalized and
+  expectedParams.get.payloadAttributes.timestamp.uint64 == timestamp and
+  expectedParams.get.payloadAttributes.suggestedFeeRecipient == feeRecipient
 
-  p.dataProvider.web3.provider.engine_newPayloadV1(payload)
+template payloadAttributes(
+    PayloadType: type engine_api.ExecutionPayloadV1,
+    timestamp: uint64,
+    randomData: Eth2Digest,
+    suggestedFeeRecipient: Eth1Address,
+    withdrawals: seq[capella.Withdrawal]): PayloadAttributesV1 =
+  engine_api.PayloadAttributesV1(
+    timestamp: Quantity timestamp,
+    prevRandao: FixedBytes[32] randomData.data,
+    suggestedFeeRecipient: suggestedFeeRecipient)
 
-proc newPayload*(p: Eth1Monitor, payload: engine_api.ExecutionPayloadV2):
-    Future[PayloadStatusV1] =
-  # Eth1 monitor can recycle connections without (external) warning; at least,
-  # don't crash.
-  if p.dataProvider.isNil:
-    let epr = newFuture[PayloadStatusV1]("newPayload")
-    epr.complete(PayloadStatusV1(status: PayloadExecutionStatus.syncing))
-    return epr
+template payloadAttributes(
+    PayloadType: type engine_api.ExecutionPayloadV2,
+    timestamp: uint64,
+    randomData: Eth2Digest,
+    suggestedFeeRecipient: Eth1Address,
+    withdrawals: seq[capella.Withdrawal]): PayloadAttributesV2 =
+  engine_api.PayloadAttributesV2(
+    timestamp: Quantity timestamp,
+    prevRandao: FixedBytes[32] randomData.data,
+    suggestedFeeRecipient: suggestedFeeRecipient,
+    withdrawals: mapIt(withdrawals, toEngineWithdrawal(it)))
 
-  p.dataProvider.web3.provider.engine_newPayloadV2(payload)
+proc getPayloadFromSingleEL(
+    connection: ELConnection,
+    PayloadType: type,
+    isForkChoiceUpToDate: bool,
+    headBlock, safeBlock, finalizedBlock: Eth2Digest,
+    timestamp: uint64,
+    randomData: Eth2Digest,
+    suggestedFeeRecipient: Eth1Address,
+    withdrawals: seq[capella.Withdrawal]): Future[PayloadType] {.async.} =
 
-proc forkchoiceUpdated*(p: Eth1Monitor,
-                        headBlock, safeBlock, finalizedBlock: Eth2Digest):
-                        Future[engine_api.ForkchoiceUpdatedResponse] =
-  # Eth1 monitor can recycle connections without (external) warning; at least,
-  # don't crash.
-  if p.isNil or p.dataProvider.isNil:
-    let fcuR =
-      newFuture[engine_api.ForkchoiceUpdatedResponse]("forkchoiceUpdated")
-    fcuR.complete(engine_api.ForkchoiceUpdatedResponse(
-      payloadStatus: PayloadStatusV1(status: PayloadExecutionStatus.syncing)))
-    return fcuR
+  let
+    rpcClient = await connection.connectedRpcClient()
+    payloadId = if isForkChoiceUpToDate and connection.lastPayloadId.isSome:
+      connection.lastPayloadId.get
+    else:
+      # TODO Add metric
+      let response = await engine_api.forkchoiceUpdated(
+        rpcClient,
+        ForkchoiceStateV1(
+          headBlockHash: headBlock.asBlockHash,
+          safeBlockHash: safeBlock.asBlockHash,
+          finalizedBlockHash: finalizedBlock.asBlockHash),
+        some PayloadType.payloadAttributes(timestamp,
+                                           randomData,
+                                           suggestedFeeRecipient,
+                                           withdrawals))
 
-  p.dataProvider.web3.provider.engine_forkchoiceUpdatedV1(
-    ForkchoiceStateV1(
-      headBlockHash: headBlock.asBlockHash,
-      safeBlockHash: safeBlock.asBlockHash,
-      finalizedBlockHash: finalizedBlock.asBlockHash),
-    none(engine_api.PayloadAttributesV1))
+      if response.payloadStatus.status != PayloadExecutionStatus.valid or
+         response.payloadId.isNone:
+        raise newException(CatchableError, "Head block is not a valid payload")
 
-proc forkchoiceUpdated*(p: Eth1Monitor,
-                        headBlock, safeBlock, finalizedBlock: Eth2Digest,
-                        timestamp: uint64,
-                        randomData: array[32, byte],
-                        suggestedFeeRecipient: Eth1Address):
-                        Future[engine_api.ForkchoiceUpdatedResponse] =
-  # Eth1 monitor can recycle connections without (external) warning; at least,
-  # don't crash.
-  if p.isNil or p.dataProvider.isNil:
-    let fcuR =
-      newFuture[engine_api.ForkchoiceUpdatedResponse]("forkchoiceUpdated")
-    fcuR.complete(engine_api.ForkchoiceUpdatedResponse(
-      payloadStatus: PayloadStatusV1(status: PayloadExecutionStatus.syncing)))
-    return fcuR
+      response.payloadId.get
 
-  p.dataProvider.web3.provider.engine_forkchoiceUpdatedV1(
-    ForkchoiceStateV1(
-      headBlockHash: headBlock.asBlockHash,
-      safeBlockHash: safeBlock.asBlockHash,
-      finalizedBlockHash: finalizedBlock.asBlockHash),
-    some(engine_api.PayloadAttributesV1(
-      timestamp: Quantity timestamp,
-      prevRandao: FixedBytes[32] randomData,
-      suggestedFeeRecipient: suggestedFeeRecipient)))
+  return await engine_api.getPayload(rpcClient, PayloadType, payloadId)
 
-# TODO can't be defined within exchangeTransitionConfiguration
-proc `==`(x, y: Quantity): bool {.borrow, noSideEffect.}
+proc cmpPayloads(lhs, rhs: SomeEngineApiExecutionPayload): int =
+  # TODO
+  1
 
 type
-  EtcStatus {.pure.} = enum
-    exchangeError
-    mismatch
-    match
+  SomeEngineApiPayloadType* =
+    engine_api.ExecutionPayloadV1 |
+    engine_api.ExecutionPayloadV2
 
-proc exchangeTransitionConfiguration*(p: Eth1Monitor): Future[EtcStatus] {.async.} =
-  # Eth1 monitor can recycle connections without (external) warning; at least,
-  # don't crash.
-  if p.isNil:
-    debug "exchangeTransitionConfiguration: nil Eth1Monitor"
-    return EtcStatus.exchangeError
+template EngineApiPayloadType*(T: type bellatrix.ExecutionPayload): type =
+  engine_api.ExecutionPayloadV1
 
-  let dataProvider = p.dataProvider
-  if dataProvider.isNil:
-    return EtcStatus.exchangeError
+template EngineApiPayloadType*(T: type capella.ExecutionPayload): type =
+  engine_api.ExecutionPayloadV2
+
+proc getPayload*(m: ELManager,
+                 PayloadType: type SomeEngineApiPayloadType,
+                 headBlock, safeBlock, finalizedBlock: Eth2Digest,
+                 timestamp: uint64,
+                 randomData: Eth2Digest,
+                 suggestedFeeRecipient: Eth1Address,
+                 withdrawals: seq[capella.Withdrawal]):
+                 Future[Opt[PayloadType]] {.async.} =
+  # TODO Pre-merge, deliver empty payload
+  # default(bellatrix.ExecutionPayload)
+
+  let isFcUpToDate = m.nextExpectedPayloadParams.areSameAs(
+    headBlock, safeBlock, finalizedBlock,
+    timestamp, suggestedFeeRecipient)
+
+  let
+    deadline = sleepAsync(GETPAYLOAD_TIMEOUT)
+    requests = m.elConnections.mapIt(it.getPayloadFromSingleEL(
+      PayloadType,
+      isFcUpToDate, headBlock, safeBlock, finalizedBlock,
+      timestamp, randomData, suggestedFeeRecipient, withdrawals
+    ))
+    requestsCompleted = allFutures(requests)
+
+  await requestsCompleted or deadline
+
+  var bestPayloadIdx = none int
+  for idx, req in requests:
+    if not req.finished:
+      req.cancel()
+    elif req.failed:
+      error "Failed to get execution payload from EL",
+            url = m.elConnections[idx].engineUrl.url,
+            err = req.error.msg
+    elif bestPayloadIdx.isNone:
+      bestPayloadIdx = some idx
+    else:
+      if cmpPayloads(req.read, requests[bestPayloadIdx.get].read) > 0:
+        bestPayloadIdx = some idx
+
+  if bestPayloadIdx.isSome:
+    return ok requests[bestPayloadIdx.get].read
+  else:
+    return err()
+
+proc sendNewPayloadToSingleEL(connection: ELConnection,
+                              payload: engine_api.ExecutionPayloadV1):
+                              Future[PayloadStatusV1] {.async.} =
+  let rpcClient = await connection.connectedRpcClient()
+  return await rpcClient.engine_newPayloadV1(payload)
+
+proc sendNewPayloadToSingleEL(connection: ELConnection,
+                              payload: engine_api.ExecutionPayloadV2):
+                              Future[PayloadStatusV1] {.async.} =
+  let rpcClient = await connection.connectedRpcClient()
+  return await rpcClient.engine_newPayloadV2(payload)
+
+type
+  StatusRelation = enum
+    newStatusIsPreferable
+    oldStatusIsOk
+    disagreement
+
+proc compareStatuses(prevStatus, newStatus: PayloadExecutionStatus): StatusRelation =
+  case prevStatus
+  of PayloadExecutionStatus.syncing:
+    if newStatus == PayloadExecutionStatus.syncing:
+      oldStatusIsOk
+    else:
+      newStatusIsPreferable
+
+  of PayloadExecutionStatus.valid:
+    case newStatus
+    of PayloadExecutionStatus.syncing,
+       PayloadExecutionStatus.accepted,
+       PayloadExecutionStatus.valid:
+      oldStatusIsOk
+    of PayloadExecutionStatus.invalid_block_hash,
+       PayloadExecutionStatus.invalid:
+      disagreement
+
+  of PayloadExecutionStatus.invalid:
+    case newStatus
+    of PayloadExecutionStatus.syncing,
+       PayloadExecutionStatus.invalid:
+      oldStatusIsOk
+    of PayloadExecutionStatus.valid,
+       PayloadExecutionStatus.accepted,
+       PayloadExecutionStatus.invalid_block_hash:
+      disagreement
+
+  of PayloadExecutionStatus.accepted:
+    case newStatus
+    of PayloadExecutionStatus.accepted,
+       PayloadExecutionStatus.syncing:
+      oldStatusIsOk
+    of PayloadExecutionStatus.valid:
+      newStatusIsPreferable
+    of PayloadExecutionStatus.invalid_block_hash,
+       PayloadExecutionStatus.invalid:
+      disagreement
+
+  of PayloadExecutionStatus.invalid_block_hash:
+    if newStatus == PayloadExecutionStatus.invalid_block_hash:
+      oldStatusIsOk
+    else:
+      disagreement
+
+proc sendNewPayload*(m: ELManager,
+                     payload: engine_api.ExecutionPayloadV1 | engine_api.ExecutionPayloadV2):
+                     Future[PayloadExecutionStatus] {.async.} =
+  let
+    deadline = sleepAsync(NEWPAYLOAD_TIMEOUT)
+    requests = m.elConnections.mapIt(sendNewPayloadToSingleEL(it, payload))
+    requestsCompleted = allFutures(requests)
+
+  await requestsCompleted or deadline
+
+  var
+    selectedResponse = none int
+    disagreementAlreadyDetected = false
+
+  for idx, req in requests:
+    if not req.finished:
+      req.cancel()
+    else:
+      let url = m.elConnections[idx].engineUrl.url
+      if req.failed:
+        engine_newPayload_failures.inc(1, [url])
+        error "Sending payload to the EL failed",
+               url, err = req.error.msg
+      else:
+        let status = req.read.status
+        engine_newPayload_sent.inc(1, [url, $status])
+
+        if selectedResponse.isNone:
+          selectedResponse = some idx
+        elif not disagreementAlreadyDetected:
+          let prevStatus = requests[selectedResponse.get].read.status
+          case compareStatuses(status, prevStatus)
+          of newStatusIsPreferable:
+            selectedResponse = some idx
+          of oldStatusIsOk:
+            discard
+          of disagreement:
+            disagreementAlreadyDetected = true
+            error "ELs disagree regarding newPayload status",
+                  url1 = m.elConnections[selectedResponse.get].engineUrl.url,
+                  status1 = prevStatus,
+                  url2 = url,
+                  status2 = status
+
+  return if disagreementAlreadyDetected:
+    PayloadExecutionStatus.invalid
+  elif selectedResponse.isSome:
+    requests[selectedResponse.get].read.status
+  else:
+    PayloadExecutionStatus.syncing
+
+proc forkchoiceUpdatedForSingleEL(
+    connection: ELConnection,
+    state: ref ForkchoiceStateV1,
+    payloadAttrs: ref Option[engine_api.PayloadAttributesV1]):
+    Future[PayloadStatusV1] {.async.} =
+  let rpcClient = await connection.connectedRpcClient()
+  let response = await rpcClient.engine_forkchoiceUpdatedV1(
+    state[], payloadAttrs[])
+
+  if response.payloadStatus.status notin {syncing, valid, invalid}:
+    debug "Invalid fork-choice updated response from the EL",
+          payloadStatus = response.payloadStatus
+    return
+
+  if response.payloadStatus.status == PayloadExecutionStatus.valid and
+     response.payloadId.isSome:
+    connection.lastPayloadId = response.payloadId
+
+  return response.payloadStatus
+
+proc forkchoiceUpdated*(m: ELManager,
+                        headBlock, safeBlock, finalizedBlock: Eth2Digest,
+                        payloadAttributes = none PayloadAttributesV1):
+                        Future[(PayloadExecutionStatus, Option[BlockHash])] {.async.} =
+  doAssert not headBlock.isZero
+
+  # Allow finalizedBlockRoot to be 0 to avoid sync deadlocks.
+  #
+  # https://github.com/ethereum/EIPs/blob/master/EIPS/eip-3675.md#pos-events
+  # has "Before the first finalized block occurs in the system the finalized
+  # block hash provided by this event is stubbed with
+  # `0x0000000000000000000000000000000000000000000000000000000000000000`."
+  # and
+  # https://github.com/ethereum/consensus-specs/blob/v1.2.0-rc.3/specs/bellatrix/validator.md#executionpayload
+  # notes "`finalized_block_hash` is the hash of the latest finalized execution
+  # payload (`Hash32()` if none yet finalized)"
+
+  if payloadAttributes.isSome:
+    m.nextExpectedPayloadParams = some NextExpectedPayloadParams(
+      headBlockRoot: headBlock,
+      safeBlockRoot: safeBlock,
+      finalizedBlockRoot: finalizedBlock,
+      payloadAttributes: payloadAttributes.get)
+
+  let
+    state = newClone ForkchoiceStateV1(
+      headBlockHash: headBlock.asBlockHash,
+      safeBlockHash: safeBlock.asBlockHash,
+      finalizedBlockHash: finalizedBlock.asBlockHash)
+    payloadAttrs = newClone payloadAttributes
+    deadline = sleepAsync(FORKCHOICEUPDATED_TIMEOUT)
+    requests = m.elConnections.mapIt(
+      it.forkchoiceUpdatedForSingleEL(state, payloadAttrs))
+    requestsCompleted = allFutures(requests)
+
+  await requestsCompleted or deadline
+
+  var
+    selectedResponse = none int
+    disagreementAlreadyDetected = false
+
+  for idx, req in requests:
+    if not req.finished:
+      req.cancel()
+    else:
+      let url = m.elConnections[idx].engineUrl.url
+      if req.failed:
+        engine_forkchoiceUpdated_failures.inc(1, [url])
+        error "Sending fork-choice update to the EL failed",
+               url, err = req.error.msg
+      else:
+        let status = req.read.status
+        engine_newPayload_sent.inc(1, [url, $status])
+
+        if selectedResponse.isNone:
+          selectedResponse = some idx
+        elif not disagreementAlreadyDetected:
+          let prevStatus = requests[selectedResponse.get].read.status
+          case compareStatuses(status, prevStatus)
+          of newStatusIsPreferable:
+            selectedResponse = some idx
+          of oldStatusIsOk:
+            discard
+          of disagreement:
+            disagreementAlreadyDetected = true
+            error "ELs disagree regarding fork-choice update status",
+                  url1 = m.elConnections[selectedResponse.get].engineUrl,
+                  status1 = prevStatus,
+                  url2 = url,
+                  status2 = status
+
+  return if disagreementAlreadyDetected:
+    (PayloadExecutionStatus.invalid, none BlockHash)
+  elif selectedResponse.isSome:
+    (requests[selectedResponse.get].read.status,
+     requests[selectedResponse.get].read.latestValidHash)
+  else:
+    (PayloadExecutionStatus.syncing, none BlockHash)
+
+proc forkchoiceUpdatedNoResult*(m: ELManager,
+                                headBlock, safeBlock, finalizedBlock: Eth2Digest,
+                                payloadAttributes = none PayloadAttributesV1) {.async.} =
+  discard await m.forkchoiceUpdated(
+    headBlock, safeBlock, finalizedBlock, payloadAttributes)
+
+# TODO can't be defined within exchangeConfigWithSingleEL
+proc `==`(x, y: Quantity): bool {.borrow, noSideEffect.}
+
+proc exchangeConfigWithSingleEL(m: ELManager, connection: ELConnection) {.async.} =
+  let rpcClient = await connection.connectedRpcClient()
+
+  if m.eth1Network.isSome and
+     connection.etcStatus == EtcStatus.notExchangedYet:
+    try:
+      let
+        providerChain =
+          awaitOrRaiseOnTimeout(rpcClient.eth_chainId(), web3RequestsTimeout)
+
+        # https://eips.ethereum.org/EIPS/eip-155#list-of-chain-ids
+        expectedChain = case m.eth1Network.get
+          of mainnet: 1.Quantity
+          of ropsten: 3.Quantity
+          of rinkeby: 4.Quantity
+          of goerli:  5.Quantity
+          of sepolia: 11155111.Quantity   # https://chainid.network/
+      if expectedChain != providerChain:
+        warn "The specified EL client is connected to a different chain",
+              url = connection.engineUrl,
+              expectedChain = distinctBase(expectedChain),
+              actualChain = distinctBase(providerChain)
+        connection.etcStatus = EtcStatus.mismatch
+        return
+    except CatchableError as exc:
+      # Typically because it's not synced through EIP-155, assuming this Web3
+      # endpoint has been otherwise working.
+      debug "Failed to obtain eth_chainId",
+             error = exc.msg
 
   # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.1/src/engine/specification.md#engine_exchangetransitionconfigurationv1
-  let consensusCfg = TransitionConfigurationV1(
-    terminalTotalDifficulty: p.depositsChain.cfg.TERMINAL_TOTAL_DIFFICULTY,
-    terminalBlockHash: p.depositsChain.cfg.TERMINAL_BLOCK_HASH,
-    terminalBlockNumber: Quantity 0)
-  let executionCfg =
-    try:
-      awaitWithRetries(
-        dataProvider.web3.provider.engine_exchangeTransitionConfigurationV1(
-          consensusCfg),
+  let
+    ourConf = TransitionConfigurationV1(
+      terminalTotalDifficulty: m.eth1Chain.cfg.TERMINAL_TOTAL_DIFFICULTY,
+      terminalBlockHash: m.eth1Chain.cfg.TERMINAL_BLOCK_HASH,
+      terminalBlockNumber: Quantity 0)
+    elConf = try:
+      awaitOrRaiseOnTimeout(
+        rpcClient.engine_exchangeTransitionConfigurationV1(ourConf),
         timeout = 1.seconds)
     except CatchableError as err:
-      warn "Failed to exchange transition configuration", err = err.msg
-      return EtcStatus.exchangeError
+      error "Failed to exchange transition configuration",
+            url = connection.engineUrl, err = err.msg
+      connection.etcStatus = EtcStatus.exchangeError
+      return
 
-  return
-    if consensusCfg.terminalTotalDifficulty != executionCfg.terminalTotalDifficulty:
+  connection.etcStatus =
+    if ourConf.terminalTotalDifficulty != elConf.terminalTotalDifficulty:
       error "Engine API configured with different terminal total difficulty",
-          engineAPI_value = executionCfg.terminalTotalDifficulty,
-          localValue = consensusCfg.terminalTotalDifficulty
+          engineAPI_value = elConf.terminalTotalDifficulty,
+          localValue = ourConf.terminalTotalDifficulty
       EtcStatus.mismatch
-    elif consensusCfg.terminalBlockNumber != executionCfg.terminalBlockNumber:
+    elif ourConf.terminalBlockNumber != elConf.terminalBlockNumber:
       warn "Engine API reporting different terminal block number",
-            engineAPI_value = executionCfg.terminalBlockNumber.uint64,
-            localValue = consensusCfg.terminalBlockNumber.uint64
+            engineAPI_value = elConf.terminalBlockNumber.uint64,
+            localValue = ourConf.terminalBlockNumber.uint64
       EtcStatus.mismatch
-    elif consensusCfg.terminalBlockHash != executionCfg.terminalBlockHash:
+    elif ourConf.terminalBlockHash != elConf.terminalBlockHash:
       warn "Engine API reporting different terminal block hash",
-            engineAPI_value = executionCfg.terminalBlockHash,
-            localValue = consensusCfg.terminalBlockHash
+            engineAPI_value = elConf.terminalBlockHash,
+            localValue = ourConf.terminalBlockHash
       EtcStatus.mismatch
     else:
-      if not p.exchangedConfiguration:
+      if connection.etcStatus == EtcStatus.notExchangedYet:
         # Log successful engine configuration exchange once at startup
-        p.exchangedConfiguration = true
-        info "Exchanged engine configuration",
-          terminalTotalDifficulty = executionCfg.terminalTotalDifficulty,
-          terminalBlockHash = executionCfg.terminalBlockHash,
-          terminalBlockNumber = executionCfg.terminalBlockNumber.uint64
+        info "Successfully exchanged engine configuration",
+             url = connection.engineUrl
       EtcStatus.match
+
+proc exchangeTransitionConfiguration*(m: ELManager) {.async.} =
+  let
+    deadline = sleepAsync(3.seconds)
+    requests = m.elConnections.mapIt(m.exchangeConfigWithSingleEL(it))
+    requestsCompleted = allFutures(requests)
+
+  await requestsCompleted or deadline
+
+  for idx, req in requests:
+    if not req.finished:
+      m.elConnections[idx].etcStatus = EtcStatus.exchangeError
+      req.cancel()
 
 template readJsonField(j: JsonNode, fieldName: string, ValueType: type): untyped =
   var res: ValueType
@@ -689,10 +1077,11 @@ template readJsonField(j: JsonNode, fieldName: string, ValueType: type): untyped
 template init[N: static int](T: type DynamicBytes[N, N]): T =
   T newSeq[byte](N)
 
-proc fetchTimestampWithRetries(blkParam: Eth1Block, p: Web3DataProviderRef) {.async.} =
-  let blk = blkParam
-  let web3block = awaitWithRetries(
-    p.getBlockByHash(blk.hash.asBlockHash))
+proc fetchTimestampWithRetries(rpcClient: RpcClient,
+                               blk: Eth1Block) {.async.} =
+  let web3block = awaitOrRaiseOnTimeout(
+    rpcClient.getBlockByHash(blk.hash.asBlockHash),
+    web3RequestsTimeout)
   blk.timestamp = Eth1BlockTimestamp web3block.timestamp
 
 func depositEventsToBlocks(depositsList: JsonNode): seq[Eth1Block] {.
@@ -756,20 +1145,16 @@ type
     DepositCountIncorrect
     DepositCountUnavailable
 
-template awaitOrRaiseOnTimeout[T](fut: Future[T],
-                                  timeout: Duration): T =
-  awaitWithTimeout(fut, timeout):
-    raise newException(DataProviderTimeout, "Timeout")
-
 when hasDepositRootChecks:
   const
     contractCallTimeout = 60.seconds
 
-  proc fetchDepositContractData(p: Web3DataProviderRef, blk: Eth1Block):
-                                Future[DepositContractDataStatus] {.async.} =
+  proc fetchDepositContractData(rpcClient: RpcClient,
+                                depositContact: Sender[DepositContract],
+                                blk: Eth1Block): Future[DepositContractDataStatus] {.async.} =
     let
-      depositRoot = p.ns.get_deposit_root.call(blockNumber = blk.number)
-      rawCount = p.ns.get_deposit_count.call(blockNumber = blk.number)
+      depositRoot = depositContract.get_deposit_root.call(blockNumber = blk.number)
+      rawCount = depositContract.get_deposit_count.call(blockNumber = blk.number)
 
     try:
       let fetchedRoot = asEth2Digest(
@@ -799,14 +1184,6 @@ when hasDepositRootChecks:
             blockNumber = blk.number,
             err = err.msg
       result = DepositCountUnavailable
-
-proc onBlockHeaders(p: Web3DataProviderRef,
-                    blockHeaderHandler: BlockHeaderHandler,
-                    errorHandler: SubscriptionErrorHandler) {.async.} =
-  info "Waiting for new Eth1 block headers"
-
-  p.blockHeadersSubscription = awaitWithRetries(
-    p.web3.subscribeForBlockHeaders(blockHeaderHandler, errorHandler))
 
 proc pruneOldBlocks(chain: var Eth1Chain, depositIndex: uint64) =
   ## Called on block finalization to delete old and now redundant data.
@@ -896,7 +1273,7 @@ proc trackFinalizedState(chain: var Eth1Chain,
                          finalizedEth1Data: Eth1Data,
                          finalizedStateDepositIndex: uint64,
                          blockProposalExpected = false): bool =
-  ## This function will return true if the Eth1Monitor is synced
+  ## This function will return true if the ELManager is synced
   ## to the finalization point.
 
   if chain.blocks.len == 0:
@@ -935,10 +1312,10 @@ proc trackFinalizedState(chain: var Eth1Chain,
   if result:
     chain.pruneOldBlocks(finalizedStateDepositIndex)
 
-template trackFinalizedState*(m: Eth1Monitor,
+template trackFinalizedState*(m: ELManager,
                               finalizedEth1Data: Eth1Data,
                               finalizedStateDepositIndex: uint64): bool =
-  trackFinalizedState(m.depositsChain, finalizedEth1Data, finalizedStateDepositIndex)
+  trackFinalizedState(m.eth1Chain, finalizedEth1Data, finalizedStateDepositIndex)
 
 # https://github.com/ethereum/consensus-specs/blob/v1.3.0-alpha.2/specs/phase0/validator.md#get_eth1_data
 proc getBlockProposalData*(chain: var Eth1Chain,
@@ -1021,44 +1398,19 @@ proc getBlockProposalData*(chain: var Eth1Chain,
     else:
       result.hasMissingDeposits = true
 
-template getBlockProposalData*(m: Eth1Monitor,
+template getBlockProposalData*(m: ELManager,
                                state: ForkedHashedBeaconState,
                                finalizedEth1Data: Eth1Data,
                                finalizedStateDepositIndex: uint64):
                                BlockProposalEth1Data =
   getBlockProposalData(
-    m.depositsChain, state, finalizedEth1Data, finalizedStateDepositIndex)
+    m.eth1Chain, state, finalizedEth1Data, finalizedStateDepositIndex)
 
-proc getJsonRpcRequestHeaders(jwtSecret: Option[seq[byte]]):
-    auto =
-  if jwtSecret.isSome:
-    let secret = jwtSecret.get
-    (proc(): seq[(string, string)] =
-      # https://www.rfc-editor.org/rfc/rfc6750#section-6.1.1
-      @[("Authorization", "Bearer " & getSignedIatToken(
-        secret, (getTime() - initTime(0, 0)).inSeconds))])
-  else:
-    (proc(): seq[(string, string)] = @[])
-
-proc new*(T: type Web3DataProvider,
-          depositContractAddress: Eth1Address,
-          web3Url: string,
-          jwtSecret: Option[seq[byte]]):
-          Future[Result[Web3DataProviderRef, string]] {.async.} =
-  let web3Fut = newWeb3(web3Url, getJsonRpcRequestHeaders(jwtSecret))
-  yield web3Fut or sleepAsync(10.seconds)
-  if (not web3Fut.finished) or web3Fut.failed:
-    await cancelAndWait(web3Fut)
-    if web3Fut.failed:
-      return err "Failed to setup web3 connection: " & web3Fut.readError.msg
-    else:
-      return err "Failed to setup web3 connection"
-
-  let
-    web3 = web3Fut.read
-    ns = web3.contractSender(DepositContract, depositContractAddress)
-
-  return ok Web3DataProviderRef(url: web3Url, web3: web3, ns: ns)
+proc new*(T: type ELConnection,
+          engineUrl: EngineApiUrl): T =
+  ELConnection(
+    engineUrl: engineUrl,
+    depositContractSyncStatus: DepositContractSyncStatus.unknown)
 
 template getOrDefault[T, E](r: Result[T, E]): T =
   type TT = T
@@ -1094,53 +1446,34 @@ proc init*(T: type Eth1Chain,
     finalizedDepositsMerkleizer: m,
     headMerkleizer: copy m)
 
-proc getBlock(provider: Web3DataProviderRef, id: BlockHashOrNumber):
-             Future[BlockObject] =
-  if id.isHash:
-    let hash = id.hash.asBlockHash()
-    return provider.getBlockByHash(hash)
-  else:
-    return provider.getBlockByNumber(id.number)
-
-proc currentEpoch(m: Eth1Monitor): Epoch =
+proc currentEpoch(m: ELManager): Epoch =
   if m.getBeaconTime != nil:
     m.getBeaconTime().slotOrZero.epoch
   else:
     Epoch 0
 
-proc init*(T: type Eth1Monitor,
-           cfg: RuntimeConfig,
-           depositContractBlockNumber: uint64,
-           depositContractBlockHash: Eth2Digest,
-           db: BeaconChainDB,
-           getBeaconTime: GetBeaconTimeFn,
-           web3Urls: seq[string],
-           eth1Network: Option[Eth1Network],
-           forcePolling: bool,
-           jwtSecret: Option[seq[byte]],
-           ttdReached: bool): T =
-  doAssert web3Urls.len > 0
-  var web3Urls = web3Urls
-  for url in mitems(web3Urls):
-    fixupWeb3Urls url
+proc new*(T: type ELManager,
+          cfg: RuntimeConfig,
+          depositContractBlockNumber: uint64,
+          depositContractBlockHash: Eth2Digest,
+          db: BeaconChainDB,
+          getBeaconTime: GetBeaconTimeFn,
+          engineApiUrls: seq[EngineApiUrl],
+          eth1Network: Option[Eth1Network],
+          ttdReached: bool): T =
+  let
+    eth1Chain = Eth1Chain.init(
+      cfg, db, depositContractBlockNumber, depositContractBlockHash)
 
-  let eth1Chain = Eth1Chain.init(
-    cfg, db, depositContractBlockNumber, depositContractBlockHash)
-
-  T(state: Initialized,
-    depositsChain: eth1Chain,
+  T(eth1Chain: eth1Chain,
     depositContractAddress: cfg.DEPOSIT_CONTRACT_ADDRESS,
-    depositContractDeployedAt: BlockHashOrNumber(
-      isHash: true,
-      hash: depositContractBlockHash),
+    depositContractBlockNumber: depositContractBlockNumber,
+    depositContractBlockHash: depositContractBlockHash.asBlockHash,
     getBeaconTime: getBeaconTime,
-    web3Urls: web3Urls,
+    elConnections: mapIt(engineApiUrls, ELConnection.new(it)),
     eth1Network: eth1Network,
-    eth1Progress: newAsyncEvent(),
-    forcePolling: forcePolling,
-    jwtSecret: jwtSecret,
     blocksPerLogsRequest: targetBlocksPerLogsRequest,
-    ttdReachedField: ttdReached)
+    ttdReachedField: ttdReached or cfg.TERMINAL_TOTAL_DIFFICULTY == 0)
 
 proc safeCancel(fut: var Future[void]) =
   if not fut.isNil and not fut.finished:
@@ -1153,92 +1486,33 @@ func clear(chain: var Eth1Chain) =
   chain.headMerkleizer = copy chain.finalizedDepositsMerkleizer
   chain.hasConsensusViolation = false
 
-proc detectPrimaryProviderComingOnline(m: Eth1Monitor) {.async.} =
-  const checkInterval = 30.seconds
+proc doStop(m: ELManager) {.async.} =
+  safeCancel m.chainSyncingLoopFut
+  safeCancel m.exchangeTransitionConfigurationLoopFut
 
-  let
-    web3Url = m.web3Urls[0]
-    initialRunFut = m.runFut
+  let closeConnectionFutures = mapIt(m.elConnections, close(it))
+  await allFutures(closeConnectionFutures)
 
-  # This is a way to detect that the monitor was restarted. When this
-  # happens, this function will just return terminating the "async thread"
-  while m.runFut == initialRunFut:
-    let tempProviderRes = await Web3DataProvider.new(
-      m.depositContractAddress,
-      web3Url,
-      m.jwtSecret)
-
-    if tempProviderRes.isErr:
-      await sleepAsync(checkInterval)
-      continue
-
-    var tempProvider = tempProviderRes.get
-
-    # Use one of the get/request-type methods from
-    # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.1/src/engine/specification.md#underlying-protocol
-    # which doesn't take parameters and returns a small structure, to ensure
-    # this works with engine API endpoints.
-    let testRequest = tempProvider.web3.provider.eth_syncing()
-
-    yield testRequest or sleepAsync(web3Timeouts)
-
-    traceAsyncErrors tempProvider.close()
-
-    if testRequest.completed and m.state == Started:
-      m.state = ReadyToRestartToPrimary
-      return
-    else:
-      await sleepAsync(checkInterval)
-
-proc doStop(m: Eth1Monitor) {.async.} =
-  safeCancel m.runFut
-
-  if m.dataProvider != nil:
-    awaitWithTimeout(m.dataProvider.close(), 30.seconds):
-      debug "Failed to close data provider in time"
-    m.dataProvider = nil
-
-proc ensureDataProvider*(m: Eth1Monitor) {.async.} =
-  if m.isNil or not m.dataProvider.isNil:
-    return
-
-  let web3Url = m.web3Urls[m.startIdx mod m.web3Urls.len]
-  inc m.startIdx
-
-  m.dataProvider = block:
-    let v = await Web3DataProvider.new(
-      m.depositContractAddress, web3Url, m.jwtSecret)
-    if v.isErr():
-      raise (ref CatchableError)(msg: v.error())
-    info "Established connection to execution layer", url = web3Url
-    v.get()
-
-proc stop(m: Eth1Monitor) {.async.} =
-  if m.state in {Started, ReadyToRestartToPrimary}:
-    m.state = Stopping
+proc stop(m: ELManager) {.async.} =
+  if not m.stopFut.isNil:
+    await m.stopFut
+  else:
     m.stopFut = m.doStop()
     await m.stopFut
-    m.state = Stopped
-  elif m.state == Stopping:
-    await m.stopFut
+    m.stopFut = nil
 
 const
   votedBlocksSafetyMargin = 50
 
-func latestEth1BlockNumber(m: Eth1Monitor): Eth1BlockNumber =
-  if m.latestEth1Block.isSome:
-    Eth1BlockNumber m.latestEth1Block.get.number
-  else:
-    Eth1BlockNumber 0
+func earliestBlockOfInterest(m: ELManager, latestEth1BlockNumber: Eth1BlockNumber): Eth1BlockNumber =
+  latestEth1BlockNumber - (2 * m.cfg.ETH1_FOLLOW_DISTANCE) - votedBlocksSafetyMargin
 
-func earliestBlockOfInterest(m: Eth1Monitor): Eth1BlockNumber =
-  m.latestEth1BlockNumber - (2 * m.cfg.ETH1_FOLLOW_DISTANCE) - votedBlocksSafetyMargin
-
-proc syncBlockRange(m: Eth1Monitor,
+proc syncBlockRange(m: ELManager,
+                    rpcClient: RpcClient,
+                    depositContract: Sender[DepositContract],
                     fromBlock, toBlock,
                     fullSyncFromBlock: Eth1BlockNumber) {.gcsafe, async.} =
-  doAssert m.dataProvider != nil, "close not called concurrently"
-  doAssert m.depositsChain.blocks.len > 0
+  doAssert m.eth1Chain.blocks.len > 0
 
   var currentBlock = fromBlock
   while currentBlock <= toBlock:
@@ -1260,14 +1534,14 @@ proc syncBlockRange(m: Eth1Monitor,
         # Reduce all request rate until we have a more general solution
         # for dealing with Infura's rate limits
         await sleepAsync(milliseconds(backoff))
-        let jsonLogsFut = m.dataProvider.ns.getJsonLogs(
+        let jsonLogsFut = depositContract.getJsonLogs(
           DepositEvent,
           fromBlock = some blockId(currentBlock),
           toBlock = some blockId(maxBlockNumberRequested))
 
         depositLogs = try:
           # Downloading large amounts of deposits may take several minutes
-          awaitWithTimeout(jsonLogsFut, web3Timeouts):
+          awaitWithTimeout(jsonLogsFut, 60.seconds):
             raise newException(DataProviderTimeout,
               "Request time out while obtaining json logs")
         except CatchableError as err:
@@ -1290,20 +1564,22 @@ proc syncBlockRange(m: Eth1Monitor,
 
     for i in 0 ..< blocksWithDeposits.len:
       let blk = blocksWithDeposits[i]
-      await blk.fetchTimestampWithRetries(m.dataProvider)
+      debug "Fetching block timestamp", blockNum = blk.number
+      await rpcClient.fetchTimestampWithRetries(blk)
 
       if blk.number > fullSyncFromBlock:
-        let lastBlock = m.depositsChain.blocks.peekLast
+        let lastBlock = m.eth1Chain.blocks.peekLast
         for n in max(lastBlock.number + 1, fullSyncFromBlock) ..< blk.number:
           debug "Obtaining block without deposits", blockNum = n
-          let blockWithoutDeposits = awaitWithRetries(
-            m.dataProvider.getBlockByNumber(n))
+          let blockWithoutDeposits = awaitOrRaiseOnTimeout(
+            rpcClient.getBlockByNumber(n),
+            web3RequestsTimeout)
 
-          m.depositsChain.addBlock(
+          m.eth1Chain.addBlock(
             lastBlock.makeSuccessorWithoutDeposits(blockWithoutDeposits))
           eth1_synced_head.set blockWithoutDeposits.number.toGaugeValue
 
-      m.depositsChain.addBlock blk
+      m.eth1Chain.addBlock blk
       eth1_synced_head.set blk.number.toGaugeValue
 
     if blocksWithDeposits.len > 0:
@@ -1311,7 +1587,9 @@ proc syncBlockRange(m: Eth1Monitor,
       template lastBlock: auto = blocksWithDeposits[lastIdx]
 
       let status = when hasDepositRootChecks:
-        awaitWithRetries m.dataProvider.fetchDepositContractData(lastBlock)
+        awaitOrRaiseOnTimeout(
+          rpcClient.fetchDepositContractData(depositContract, lastBlock),
+          web3RequestsTimeout)
       else:
         DepositRootUnavailable
 
@@ -1346,31 +1624,32 @@ proc syncBlockRange(m: Eth1Monitor,
             depositContractState: m.headMerkleizer.toDepositContractState,
             blockNumber: lastBlock.number)
 
-        m.depositsChain.db.putDepositTreeSnapshot depositTreeSnapshot
+        m.db.putDepositTreeSnapshot depositTreeSnapshot
 
       if m.genesisStateFut != nil and m.chainHasEnoughValidators:
-        let lastIdx = m.depositsChain.blocks.len - 1
-        template lastBlock: auto = m.depositsChain.blocks[lastIdx]
+        let lastIdx = m.eth1Chain.blocks.len - 1
+        template lastBlock: auto = m.eth1Chain.blocks[lastIdx]
 
         if maxBlockNumberRequested == toBlock and
-           (m.depositsChain.blocks.len == 0 or lastBlock.number != toBlock):
-          let web3Block = awaitWithRetries(
-            m.dataProvider.getBlockByNumber(toBlock))
+           (m.eth1Chain.blocks.len == 0 or lastBlock.number != toBlock):
+          let web3Block = awaitOrRaiseOnTimeout(
+            rpcClient.getBlockByNumber(toBlock),
+            ethRequetsTimeout)
 
           debug "Latest block doesn't hold deposits. Obtaining it",
                  ts = web3Block.timestamp.uint64,
                  number = web3Block.number.uint64
 
-          m.depositsChain.addBlock lastBlock.makeSuccessorWithoutDeposits(web3Block)
+          m.eth1Chain.addBlock lastBlock.makeSuccessorWithoutDeposits(web3Block)
         else:
-          await lastBlock.fetchTimestampWithRetries(m.dataProvider)
+          await rpcClient.fetchTimestampWithRetries(lastBlock)
 
-        var genesisBlockIdx = m.depositsChain.blocks.len - 1
-        if m.isAfterMinGenesisTime(m.depositsChain.blocks[genesisBlockIdx]):
+        var genesisBlockIdx = m.eth1Chain.blocks.len - 1
+        if m.isAfterMinGenesisTime(m.eth1Chain.blocks[genesisBlockIdx]):
           for i in 1 ..< blocksWithDeposits.len:
-            let idx = (m.depositsChain.blocks.len - 1) - i
-            let blk = m.depositsChain.blocks[idx]
-            await blk.fetchTimestampWithRetries(m.dataProvider)
+            let idx = (m.eth1Chain.blocks.len - 1) - i
+            let blk = m.eth1Chain.blocks[idx]
+            await rpcClient.fetchTimestampWithRetries(blk)
             if m.isGenesisCandidate(blk):
               genesisBlockIdx = idx
             else:
@@ -1388,25 +1667,26 @@ proc syncBlockRange(m: Eth1Monitor,
           # We'll handle this special case below by examing whether we are in
           # this potential scenario and we'll use a fast guessing algorith to
           # discover the ETh1 block with minimal valid genesis time.
-          var genesisBlock = m.depositsChain.blocks[genesisBlockIdx]
+          var genesisBlock = m.eth1Chain.blocks[genesisBlockIdx]
           if genesisBlockIdx > 0:
-            let genesisParent = m.depositsChain.blocks[genesisBlockIdx - 1]
+            let genesisParent = m.eth1Chain.blocks[genesisBlockIdx - 1]
             if genesisParent.timestamp == 0:
-              await genesisParent.fetchTimestampWithRetries(m.dataProvider)
+              await rpcClient.fetchTimestampWithRetries(genesisParent)
             if m.hasEnoughValidators(genesisParent) and
                genesisBlock.number - genesisParent.number > 1:
-              genesisBlock = awaitWithRetries(
-                m.findGenesisBlockInRange(genesisParent, genesisBlock))
+              genesisBlock = awaitOrRaiseOnTimeout(
+                m.findGenesisBlockInRange(genesisParent, genesisBlock),
+                web3RequestsTimeout)
 
           m.signalGenesis m.createGenesisState(genesisBlock)
 
 func init(T: type FullBlockId, blk: Eth1BlockHeader|BlockObject): T =
   FullBlockId(number: Eth1BlockNumber blk.number, hash: blk.hash)
 
-func isNewLastBlock(m: Eth1Monitor, blk: Eth1BlockHeader|BlockObject): bool =
+func isNewLastBlock(m: ELManager, blk: Eth1BlockHeader|BlockObject): bool =
   m.latestEth1Block.isNone or blk.number.uint64 > m.latestEth1BlockNumber
 
-proc findTerminalBlock(provider: Web3DataProviderRef,
+proc findTerminalBlock(rpcClient: RpcClient,
                        ttd: Uint256): Future[BlockObject] {.async.} =
   ## Find the first execution block with a difficulty higher than the
   ## specified `ttd`.
@@ -1421,14 +1701,15 @@ proc findTerminalBlock(provider: Web3DataProviderRef,
     if key in cache:
       return cache[key]
     # Not cached, fetch.
-    let value = awaitWithRetries provider.getBlockByNumber(key)
+    let value = awaitOrRaiseOnTimeout(rpcClient.getBlockByNumber(key),
+                                      web3RequestsTimeout)
     cache[key] = value
     return value
 
   # Block A follows, B leads.
   var
-    a = awaitWithRetries(
-      provider.web3.provider.eth_getBlockByNumber("latest", false))
+    a = awaitOrRaiseOnTimeout(rpcClient.eth_getBlockByNumber("latest", false),
+                              web3RequestsTimeout)
     b = await next(a)
 
   while true:
@@ -1448,241 +1729,269 @@ proc findTerminalBlock(provider: Web3DataProviderRef,
   # This is unreachable.
   doAssert(false)
 
-proc startEth1Syncing(m: Eth1Monitor, delayBeforeStart: Duration) {.async.} =
-  if m.state == Started:
+func hasProperlyConfiguredConnection(m: ELManager): bool =
+  for connection in m.elConnections:
+    if connection.etcStatus == EtcStatus.match:
+      return true
+
+  return false
+
+proc shouldExchangeTransitionConfiguration*(m: ELManager): bool =
+  # We start exchanging the configuration roughly two weeks before the hard-fork
+  m.currentEpoch + 14 * 256 >= m.cfg.BELLATRIX_FORK_EPOCH
+
+proc startExchangeTransitionConfigurationLoop(m: ELManager) {.async.} =
+  debug "Starting exchange transition configuration loop"
+
+  if m.shouldExchangeTransitionConfiguration and not m.hasProperlyConfiguredConnection:
+    await m.exchangeTransitionConfiguration()
+    if not m.hasProperlyConfiguredConnection:
+      fatal "The Bellatrix hard fork requires the beacon node to be connected a properly configured Engine API end-point. " &
+            "See https://nimbus.guide/merge.html for more details."
+      quit 1
+
+  while true:
+    # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.1/src/engine/specification.md#engine_exchangetransitionconfigurationv1
+    await sleepAsync(60.seconds)
+    debug "Exchange transition configuration tick"
+    if m.shouldExchangeTransitionConfiguration:
+      traceAsyncErrors m.exchangeTransitionConfiguration()
+
+proc waitELToSyncDeposits(connection: ELConnection,
+                          minimalRequiredBlock: BlockHash) {.async.} =
+  var rpcClient = await connection.connectedRpcClient()
+
+  if connection.depositContractSyncStatus == DepositContractSyncStatus.synced:
     return
 
-  let isFirstRun = m.state == Initialized
-  let needsReset = m.state in {Failed, ReadyToRestartToPrimary}
+  var attempt = 0
 
-  m.state = Started
-
-  if delayBeforeStart != ZeroDuration:
-    await sleepAsync(delayBeforeStart)
-
-  # If the monitor died with an exception, the web3 provider may be in
-  # an arbitary state, so we better reset it (not doing this has resulted
-  # in resource leaks historically).
-  if not m.dataProvider.isNil and needsReset:
-    # We introduce a local var to eliminate the risk of scheduling two
-    # competing calls to `close` below.
-    let provider = m.dataProvider
-    m.dataProvider = nil
-    await provider.close()
-
-  await m.ensureDataProvider()
-  doAssert m.dataProvider != nil, "close not called concurrently"
-
-  # We might need to reset the chain if the new provider disagrees
-  # with the previous one regarding the history of the chain or if
-  # we have detected a conensus violation - our view disagreeing with
-  # the majority of the validators in the network.
-  #
-  # Consensus violations happen in practice because the web3 providers
-  # sometimes return incomplete or incorrect deposit log events even
-  # when they don't indicate any errors in the response. When this
-  # happens, we are usually able to download the data successfully
-  # on the second attempt.
-  if m.latestEth1Block.isSome and m.depositsChain.blocks.len > 0:
-    let needsReset = m.depositsChain.hasConsensusViolation or (block:
-      let
-        lastKnownBlock = m.depositsChain.blocks.peekLast
-        matchingBlockAtNewProvider = awaitWithRetries(
-          m.dataProvider.getBlockByNumber lastKnownBlock.number)
-
-      lastKnownBlock.hash.asBlockHash != matchingBlockAtNewProvider.hash)
-
-    if needsReset:
-      m.depositsChain.clear()
-      m.latestEth1Block = none(FullBlockId)
-
-  template web3Url: string = m.dataProvider.url
-
-  if web3Url != m.web3Urls[0]:
-    asyncSpawn m.detectPrimaryProviderComingOnline()
-
-  info "Starting Eth1 deposit contract monitoring",
-    contract = $m.depositContractAddress
-
-  if isFirstRun and m.eth1Network.isSome:
-    try:
-      let
-        providerChain =
-          awaitWithRetries m.dataProvider.web3.provider.eth_chainId()
-
-        # https://eips.ethereum.org/EIPS/eip-155#list-of-chain-ids
-        expectedChain = case m.eth1Network.get
-          of mainnet: 1.Quantity
-          of ropsten: 3.Quantity
-          of rinkeby: 4.Quantity
-          of goerli:  5.Quantity
-          of sepolia: 11155111.Quantity   # https://chainid.network/
-      if expectedChain != providerChain:
-        fatal "The specified Web3 provider serves data for a different chain",
-               expectedChain = distinctBase(expectedChain),
-               providerChain = distinctBase(providerChain)
-        quit 1
-    except CatchableError as exc:
-      # Typically because it's not synced through EIP-155, assuming this Web3
-      # endpoint has been otherwise working.
-      debug "startEth1Syncing: eth_chainId failed: ",
-        error = exc.msg
-
-  var mustUsePolling = m.forcePolling or
-                       web3Url.startsWith("http://") or
-                       web3Url.startsWith("https://")
-
-  if not mustUsePolling:
-    proc newBlockHeadersHandler(blk: Eth1BlockHeader)
-                               {.raises: [Defect], gcsafe.} =
-      try:
-        if m.isNewLastBlock(blk):
-          eth1_latest_head.set blk.number.toGaugeValue
-          m.latestEth1Block = some FullBlockId.init(blk)
-          m.eth1Progress.fire()
-      except Exception:
-        # TODO Investigate why this exception is being raised
-        raiseAssert "AsyncEvent.fire should not raise exceptions"
-
-    proc subscriptionErrorHandler(err: CatchableError)
-                                 {.raises: [Defect], gcsafe.} =
-      warn "Failed to subscribe for block headers. Switching to polling",
-            err = err.msg
-      mustUsePolling = true
-
-    await m.dataProvider.onBlockHeaders(newBlockHeadersHandler,
-                                        subscriptionErrorHandler)
-
-  let shouldProcessDeposits = not (
-    m.depositContractAddress.isZeroMemory or
-    m.depositsChain.finalizedBlockHash.data.isZeroMemory)
-
-  var eth1SyncedTo: Eth1BlockNumber
-  if shouldProcessDeposits:
-    if m.depositsChain.blocks.len == 0:
-      let startBlock = awaitWithRetries(
-        m.dataProvider.getBlockByHash(
-          m.depositsChain.finalizedBlockHash.asBlockHash))
-
-      m.depositsChain.addBlock Eth1Block(
-        hash: m.depositsChain.finalizedBlockHash,
-        number: Eth1BlockNumber startBlock.number,
-        timestamp: Eth1BlockTimestamp startBlock.timestamp)
-
-    eth1SyncedTo = Eth1BlockNumber m.depositsChain.blocks[^1].number
-
-    eth1_synced_head.set eth1SyncedTo.toGaugeValue
-    eth1_finalized_head.set eth1SyncedTo.toGaugeValue
-    eth1_finalized_deposits.set(
-      m.depositsChain.finalizedDepositsMerkleizer.getChunkCount.toGaugeValue)
-
-    debug "Starting Eth1 syncing", `from` = shortLog(m.depositsChain.blocks[^1])
-
-  let shouldCheckForMergeTransition = block:
-    const FAR_FUTURE_TOTAL_DIFFICULTY =
-      u256"115792089237316195423570985008687907853269984665640564039457584007913129638912"
-    (not m.ttdReachedField) and
-    (m.cfg.TERMINAL_TOTAL_DIFFICULTY != FAR_FUTURE_TOTAL_DIFFICULTY)
-
-  var didPollOnce = false
   while true:
-    if bnStatus == BeaconNodeStatus.Stopping:
-      when hasGenesisDetection:
-        if not m.genesisStateFut.isNil:
-          m.genesisStateFut.complete()
-          m.genesisStateFut = nil
-      await m.stop()
+    try:
+      discard awaitOrRaiseOnTimeout(rpcClient.getBlockByHash(minimalRequiredBlock),
+                                    web3RequestsTimeout)
+      connection.depositContractSyncStatus = DepositContractSyncStatus.synced
       return
+    except CancelledError as err:
+      trace "waitELToSyncDepositContract cancelled",
+             url = connection.engineUrl.url
+      raise err
+    except CatchableError as err:
+      connection.depositContractSyncStatus = DepositContractSyncStatus.notSynced
+      if attempt == 0:
+        warn "Failed to obtain the most recent known block from the execution " &
+             "layer node (the node is probably not synced)",
+             url = connection.engineUrl.url,
+             blk = minimalRequiredBlock,
+             err = err.msg
+      elif attempt mod 60 == 0:
+        # This warning will be produced every 30 minutes
+        warn "Still failing to obtain the most recent known block from the " &
+             "execution layer node (the node is probably still not synced)",
+             url = connection.engineUrl.url,
+             blk = minimalRequiredBlock,
+             err = err.msg
+      await sleepAsync(seconds(30))
+      rpcClient = await connection.connectedRpcClient()
 
-    if m.depositsChain.hasConsensusViolation:
-      raise newException(CorruptDataProvider, "Eth1 chain contradicts Eth2 consensus")
+func mostRecentKnownBlock(m: ELManager): BlockHash =
+  if m.eth1Chain.finalizedDepositsMerkleizer.getChunkCount() > 0:
+    m.eth1Chain.finalizedBlockHash.asBlockHash
+  else:
+    m.depositContractBlockHash
 
-    if m.state == ReadyToRestartToPrimary:
-      info "Primary web3 provider is back online. Restarting the Eth1 monitor"
-      m.startIdx = 0
-      return
+proc networkHasDepositContract(m: ELManager): bool =
+  not m.cfg.DEPOSIT_CONTRACT_ADDRESS.isDefaultValue
 
-    let nextBlock = if mustUsePolling or not didPollOnce:
-      let blk = awaitWithRetries(
-        m.dataProvider.web3.provider.eth_getBlockByNumber(blockId("latest"), false))
+proc selectConnectionForChainSyncing(m: ELManager): Future[ELConnection] {.async.} =
+  let connectionsFuts = mapIt(
+    m.elConnections,
+    if m.networkHasDepositContract:
+      FutureBase waitELToSyncDeposits(it, m.mostRecentKnownBlock)
+    else:
+      FutureBase connectedRpcClient(it))
 
-      # Same as when handling events, minus `m.eth1Progress` round trip
-      if m.isNewLastBlock(blk):
-        eth1_latest_head.set blk.number.toGaugeValue
-        m.latestEth1Block = some FullBlockId.init(blk)
-      elif mustUsePolling:
+  let firstConnected = await firstCompletedFuture(connectionsFuts)
+  return m.elConnections[find(connectionsFuts, firstConnected)]
+
+proc syncEth1Chain(m: ELManager, connection: ELConnection) {.async.} =
+  let rpcClient = await connection.connectedRpcClient()
+
+  let
+    shouldProcessDeposits = not (
+      m.depositContractAddress.isZeroMemory or
+      m.eth1Chain.finalizedBlockHash.data.isZeroMemory)
+
+  while true:
+    logScope:
+      url = connection.engineUrl.url
+
+    # We might need to reset the chain if the new provider disagrees
+    # with the previous one regarding the history of the chain or if
+    # we have detected a conensus violation - our view disagreeing with
+    # the majority of the validators in the network.
+    #
+    # Consensus violations happen in practice because the web3 providers
+    # sometimes return incomplete or incorrect deposit log events even
+    # when they don't indicate any errors in the response. When this
+    # happens, we are usually able to download the data successfully
+    # on the second attempt.
+    #
+    # TODO
+    # Perhaps the above problem was manifesting only with the obsolete
+    # JSON-RPC data providers, which can no longer be used with Nimbus.
+    if m.eth1Chain.blocks.len > 0:
+      let needsReset = m.eth1Chain.hasConsensusViolation or (block:
+        let
+          lastKnownBlock = m.eth1Chain.blocks.peekLast
+          matchingBlockAtNewProvider = awaitOrRaiseOnTimeout(
+            rpcClient.getBlockByNumber(lastKnownBlock.number),
+            web3RequestsTimeout)
+
+        lastKnownBlock.hash.asBlockHash != matchingBlockAtNewProvider.hash)
+
+      if needsReset:
+        m.eth1Chain.clear()
+
+    var eth1SyncedTo: Eth1BlockNumber
+    if shouldProcessDeposits:
+      if m.eth1Chain.blocks.len == 0:
+        let finalizedBlockHash = m.eth1Chain.finalizedBlockHash.asBlockHash
+        let startBlock =
+          awaitOrRaiseOnTimeout(rpcClient.getBlockByHash(finalizedBlockHash),
+                                web3RequestsTimeout)
+
+        m.eth1Chain.addBlock Eth1Block(
+          hash: m.eth1Chain.finalizedBlockHash,
+          number: Eth1BlockNumber startBlock.number,
+          timestamp: Eth1BlockTimestamp startBlock.timestamp)
+
+      eth1SyncedTo = m.eth1Chain.blocks[^1].number
+
+      eth1_synced_head.set eth1SyncedTo.toGaugeValue
+      eth1_finalized_head.set eth1SyncedTo.toGaugeValue
+      eth1_finalized_deposits.set(
+        m.eth1Chain.finalizedDepositsMerkleizer.getChunkCount.toGaugeValue)
+
+      debug "Starting Eth1 syncing", `from` = shortLog(m.eth1Chain.blocks[^1])
+
+    let shouldCheckForMergeTransition = block:
+      const FAR_FUTURE_TOTAL_DIFFICULTY =
+        u256"115792089237316195423570985008687907853269984665640564039457584007913129638912"
+      (not m.ttdReachedField) and
+      (m.cfg.TERMINAL_TOTAL_DIFFICULTY != FAR_FUTURE_TOTAL_DIFFICULTY)
+
+    while true:
+      if bnStatus == BeaconNodeStatus.Stopping:
+        when hasGenesisDetection:
+          if not m.genesisStateFut.isNil:
+            m.genesisStateFut.complete()
+            m.genesisStateFut = nil
+        await m.stop()
+        return
+
+      if m.eth1Chain.hasConsensusViolation:
+        raise newException(CorruptDataProvider, "Eth1 chain contradicts Eth2 consensus")
+
+      let latestBlock = try:
+        awaitOrRaiseOnTimeout(
+          rpcClient.eth_getBlockByNumber(blockId("latest"), false),
+          web3RequestsTimeout)
+      except CatchableError as err:
+        error "Failed to obtain the latest block from the EL", err = err.msg
+        raise err
+
+      m.syncTargetBlock = some(Eth1BlockNumber(latestBlock.number) -
+                               m.cfg.ETH1_FOLLOW_DISTANCE)
+      if m.syncTargetBlock.get <= eth1SyncedTo:
+        # The chain reorged to a lower height.
+        # It's relatively safe to ignore that.
         await sleepAsync(m.cfg.SECONDS_PER_ETH1_BLOCK.int.seconds)
         continue
-      else:
-        doAssert not didPollOnce
 
-      didPollOnce = true
-      blk
-    else:
-      awaitWithTimeout(m.eth1Progress.wait(), 5.minutes):
-        raise newException(CorruptDataProvider, "No eth1 chain progress for too long")
+      eth1_latest_head.set latestBlock.number.toGaugeValue
 
-      m.eth1Progress.clear()
+      if m.currentEpoch >= m.cfg.BELLATRIX_FORK_EPOCH and m.terminalBlockHash.isNone:
+        var terminalBlockCandidate = latestBlock
 
-      doAssert m.latestEth1Block.isSome
-      awaitWithRetries m.dataProvider.getBlockByHash(m.latestEth1Block.get.hash)
+        info "startChainSyncingLoop: checking for merge terminal block",
+          currentEpoch = m.currentEpoch,
+          BELLATRIX_FORK_EPOCH = m.cfg.BELLATRIX_FORK_EPOCH,
+          totalDifficulty = $latestBlock.totalDifficulty,
+          ttd = $m.cfg.TERMINAL_TOTAL_DIFFICULTY,
+          terminalBlockHash = m.terminalBlockHash
 
-    # TODO when a terminal block hash is configured in cfg.TERMINAL_BLOCK_HASH,
-    #      we should try to fetch that block from the EL - this facility is not
-    #      in use on any current network, but should be implemented for full
-    #      compliance
-    if m.terminalBlockHash.isNone and shouldCheckForMergeTransition:
-      let terminalBlock = await findTerminalBlock(m.dataProvider, m.cfg.TERMINAL_TOTAL_DIFFICULTY)
-      m.terminalBlockHash = some(terminalBlock.hash)
-      m.ttdReachedField = true
+        # TODO when a terminal block hash is configured in cfg.TERMINAL_BLOCK_HASH,
+        #      we should try to fetch that block from the EL - this facility is not
+        #      in use on any current network, but should be implemented for full
+        #      compliance
+        if m.terminalBlockHash.isNone and shouldCheckForMergeTransition:
+          let terminalBlock = await findTerminalBlock(
+            rpcClient,
+            m.cfg.TERMINAL_TOTAL_DIFFICULTY)
+          m.terminalBlockHash = some(terminalBlock.hash)
+          m.ttdReachedField = true
+          debug "startEth1Syncing: found merge terminal block",
+            currentEpoch = m.currentEpoch,
+            BELLATRIX_FORK_EPOCH = m.cfg.BELLATRIX_FORK_EPOCH,
+            ttd = $m.cfg.TERMINAL_TOTAL_DIFFICULTY,
+            terminalBlockDifficulty = $terminalBlock.totalDifficulty,
+            terminalBlockHash = m.terminalBlockHash.get,
+            terminalBlockNumber = distinctBase(terminalBlock.number)
 
-      debug "startEth1Syncing: found merge terminal block",
-        currentEpoch = m.currentEpoch,
-        BELLATRIX_FORK_EPOCH = m.cfg.BELLATRIX_FORK_EPOCH,
-        totalDifficulty = $nextBlock.totalDifficulty,
-        ttd = $m.cfg.TERMINAL_TOTAL_DIFFICULTY,
-        terminalBlockHash = m.terminalBlockHash,
-        candidateBlockNumber = distinctBase(terminalBlock.number)
+      if shouldProcessDeposits and
+         latestBlock.number.uint64 > m.cfg.ETH1_FOLLOW_DISTANCE:
+        let depositContract = connection.web3.get.contractSender(
+          DepositContract, m.depositContractAddress)
+        await m.syncBlockRange(rpcClient,
+                               depositContract,
+                               eth1SyncedTo + 1,
+                               m.syncTargetBlock.get,
+                               m.earliestBlockOfInterest(Eth1BlockNumber latestBlock.number))
 
-    if shouldProcessDeposits:
-      if m.latestEth1BlockNumber <= m.cfg.ETH1_FOLLOW_DISTANCE:
-        continue
-
-      let targetBlock = m.latestEth1BlockNumber - m.cfg.ETH1_FOLLOW_DISTANCE
-      if targetBlock <= eth1SyncedTo:
-        continue
-
-      let earliestBlockOfInterest = m.earliestBlockOfInterest()
-      await m.syncBlockRange(eth1SyncedTo + 1,
-                             targetBlock,
-                             earliestBlockOfInterest)
-      eth1SyncedTo = targetBlock
+      eth1SyncedTo = m.syncTargetBlock.get
       eth1_synced_head.set eth1SyncedTo.toGaugeValue
 
-proc start(m: Eth1Monitor, delayBeforeStart: Duration) {.gcsafe.} =
-  if m.runFut.isNil:
-    let runFut = m.startEth1Syncing(delayBeforeStart)
-    m.runFut = runFut
-    runFut.addCallback do (p: pointer) {.gcsafe.}:
-      if runFut.failed:
-        if runFut == m.runFut:
-          warn "Eth1 chain monitoring failure, restarting", err = runFut.error.msg
-          m.state = Failed
+proc startChainSyncingLoop(m: ELManager) {.async.} =
+  info "Starting execution layer deposits syncing",
+        contract = $m.depositContractAddress
 
-      safeCancel m.runFut
-      m.start(5.seconds)
+  while true:
+    let connection = try: await m.selectConnectionForChainSyncing()
+                     except CancelledError as err:
+                       raise err
+                     except CatchableError as err:
+                       error "No suitable el connection for deposit syncing"
+                       await sleepAsync(chronos.seconds(30))
+                       continue
+    try:
+      await syncEth1Chain(m, connection)
+    except CatchableError as err:
+      # TODO: edge triggered logging of failures
+      error "Error while syncing deposits",
+             url = connection.engineUrl.url, err = err.msg
 
-proc start*(m: Eth1Monitor) =
-  m.start(0.seconds)
+proc start*(m: ELManager) {.gcsafe.} =
+  if m.elConnections.len == 0:
+    return
+
+  ## Calling `ELManager.start()` on an already started ELManager is a noop
+  if m.chainSyncingLoopFut.isNil:
+    m.chainSyncingLoopFut =
+      m.startChainSyncingLoop()
+
+  if m.hasJwtSecret and m.exchangeTransitionConfigurationLoopFut.isNil:
+    m.exchangeTransitionConfigurationLoopFut =
+      m.startExchangeTransitionConfigurationLoop()
 
 proc getEth1BlockHash*(
-    url: string, blockId: RtBlockIdentifier, jwtSecret: Option[seq[byte]]):
+    url: EngineApiUrl, blockId: RtBlockIdentifier, jwtSecret: Option[seq[byte]]):
     Future[BlockHash] {.async.} =
-  let web3 = awaitOrRaiseOnTimeout(newWeb3(url, getJsonRpcRequestHeaders(jwtSecret)),
-                                   10.seconds)
+  let web3 = awaitOrRaiseOnTimeout(url.newWeb3(), 10.seconds)
   try:
-    let blk = awaitWithRetries(
-      web3.provider.eth_getBlockByNumber(blockId, false))
+    let blk = awaitOrRaiseOnTimeout(
+      web3.provider.eth_getBlockByNumber(blockId, false),
+      web3RequestsTimeout)
     return blk.hash
   finally:
     await web3.close()
@@ -1712,7 +2021,7 @@ proc testWeb3Provider*(web3Url: Uri,
     stdout.flushFile()
     var res: typeof(read action)
     try:
-      res = awaitWithRetries action
+      res = awaitOrRaiseOnTimeout(action, web3RequestsTimeout)
       stdout.write "\r" & actionDesc & ": " & $res
     except CatchableError as err:
       stdout.write "\r" & actionDesc & ": Error(" & err.msg & ")"
@@ -1744,13 +2053,14 @@ proc testWeb3Provider*(web3Url: Uri,
       ns.get_deposit_root.call(blockNumber = latestBlock.number.uint64)
 
 when hasGenesisDetection:
-  proc loadPersistedDeposits*(monitor: Eth1Monitor) =
-    for i in 0 ..< monitor.depositsChain.db.genesisDeposits.len:
-      monitor.produceDerivedData monitor.depositsChain.db.genesisDeposits.get(i)
+  proc loadPersistedDeposits*(monitor: ELManager) =
+    for i in 0 ..< monitor.db.genesisDeposits.len:
+      monitor.produceDerivedData monitor.db.genesisDeposits.get(i)
 
-  proc findGenesisBlockInRange(m: Eth1Monitor, startBlock, endBlock: Eth1Block):
+  proc findGenesisBlockInRange(m: ELManager,
+                               rpcClient: RpcClient,
+                               startBlock, endBlock: Eth1Block):
                                Future[Eth1Block] {.async.} =
-    doAssert m.dataProvider != nil, "close not called concurrently"
     doAssert startBlock.timestamp != 0 and not m.isAfterMinGenesisTime(startBlock)
     doAssert endBlock.timestamp != 0 and m.isAfterMinGenesisTime(endBlock)
     doAssert m.hasEnoughValidators(startBlock)
@@ -1769,8 +2079,9 @@ when hasGenesisDetection:
                           float(endBlock.number - startBlock.number)
         blocksToJump = max(float(MIN_GENESIS_TIME - startBlockTime) / secondsPerBlock, 1.0)
         candidateNumber = min(endBlock.number - 1, startBlock.number + blocksToJump.uint64)
-        candidateBlock = awaitWithRetries(
-          m.dataProvider.getBlockByNumber(candidateNumber))
+        candidateBlock = awaitOrRaiseOnTimeout(
+          rpcClient.getBlockByNumber(candidateNumber),
+          web3RequestsTimeout)
 
       var candidateAsEth1Block = Eth1Block(hash: candidateBlock.hash.asEth2Digest,
                                            number: candidateBlock.number.uint64,
@@ -1793,7 +2104,7 @@ when hasGenesisDetection:
 
     return endBlock
 
-  proc waitGenesis*(m: Eth1Monitor): Future[GenesisStateRef] {.async.} =
+  proc waitGenesis*(m: ELManager): Future[GenesisStateRef] {.async.} =
     if m.genesisState.isNil:
       m.start()
 

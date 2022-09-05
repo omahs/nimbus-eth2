@@ -7,8 +7,8 @@
 # To start miner, run miner.start()
 # To increase verbosity: debug.verbosity(4)
 
-GENESISJSON=$(mktemp)
-GETHDATADIR=$(mktemp -d)
+GENESIS_JSON=$(mktemp)
+GETH_DATA_DIR=$(mktemp -d)
 
 echo \{\
 	\"config\": \{\
@@ -44,13 +44,13 @@ echo \{\
 	\"gasUsed\":\"0x0\",\
 	\"parentHash\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\
 	\"baseFeePerGas\":\"0x7\"\
-\} > "${GENESISJSON}"
+\} > "${GENESIS_JSON}"
 
 # Initialize the genesis
-~/go-ethereum/build/bin/geth --http --ws -http.api "engine" --datadir "${GETHDATADIR}" init "${GENESISJSON}"
+~/go-ethereum/build/bin/geth --http --ws -http.api "engine" --datadir "${GETH_DATA_DIR}" init "${GENESIS_JSON}"
 
 # Import the signing key (press enter twice for empty password)
-~/go-ethereum/build/bin/geth --http --ws -http.api "engine" --datadir "${GETHDATADIR}" account import <(echo 45a915e4d060149eb4365960e6a7a45f334393093061116b197e3240065ff2d8)
+~/go-ethereum/build/bin/geth --http --ws -http.api "engine" --datadir "${GETH_DATA_DIR}" account import <(echo 45a915e4d060149eb4365960e6a7a45f334393093061116b197e3240065ff2d8)
 
 # Start the node (and press enter once to unlock the account)
-~/go-ethereum/build/bin/geth --http --ws --http.api "eth,net,engine" -ws.api "eth,net,engine" --datadir "${GETHDATADIR}" --allow-insecure-unlock --unlock "0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b" --password "" --nodiscover console
+~/go-ethereum/build/bin/geth --http --ws --http.api "eth,net,engine" -ws.api "eth,net,engine" --datadir "${GETH_DATA_DIR}" --allow-insecure-unlock --unlock "0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b" --password "" --nodiscover console

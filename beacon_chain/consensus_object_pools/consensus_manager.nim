@@ -11,10 +11,11 @@ else:
   {.push raises: [].}
 
 import
-  chronicles, chronos,
+  chronicles, chronos, web3/ethtypes,
   ../spec/datatypes/base,
   ../consensus_object_pools/[blockchain_dag, block_quarantine, attestation_pool],
-  ../eth1/eth1_monitor
+  ../eth1/eth1_monitor,
+  ../beacon_clock
 
 from ../spec/eth2_apis/dynamic_fee_recipients import
   DynamicFeeRecipientsStore, getDynamicFeeRecipient
@@ -23,14 +24,6 @@ from ../validators/keystore_management import
 from ../validators/action_tracker import ActionTracker, getNextProposalSlot
 
 type
-  ForkChoiceUpdatedInformation* = object
-    payloadId*: PayloadID
-    headBlockRoot*: Eth2Digest
-    safeBlockRoot*: Eth2Digest
-    finalizedBlockRoot*: Eth2Digest
-    timestamp*: uint64
-    feeRecipient*: Eth1Address
-
   ConsensusManager* = object
     expectedSlot: Slot
     expectedBlockReceived: Future[bool]
@@ -46,7 +39,7 @@ type
 
     # Execution layer integration
     # ----------------------------------------------------------------
-    eth1Monitor*: Eth1Monitor
+    elManager*: ELManager
 
     # Allow determination of whether there's an upcoming proposal
     # ----------------------------------------------------------------
@@ -60,7 +53,6 @@ type
 
     # Tracking last proposal forkchoiceUpdated payload information
     # ----------------------------------------------------------------
-    forkchoiceUpdatedInfo*: Opt[ForkchoiceUpdatedInformation]
     optimisticHead: tuple[bid: BlockId, execution_block_hash: Eth2Digest]
 
 # Initialization
@@ -70,7 +62,7 @@ func new*(T: type ConsensusManager,
           dag: ChainDAGRef,
           attestationPool: ref AttestationPool,
           quarantine: ref Quarantine,
-          eth1Monitor: Eth1Monitor,
+          elManager: ELManager,
           actionTracker: ActionTracker,
           dynamicFeeRecipientsStore: ref DynamicFeeRecipientsStore,
           validatorsDir: string,
@@ -80,11 +72,10 @@ func new*(T: type ConsensusManager,
     dag: dag,
     attestationPool: attestationPool,
     quarantine: quarantine,
-    eth1Monitor: eth1Monitor,
+    elManager: elManager,
     actionTracker: actionTracker,
     dynamicFeeRecipientsStore: dynamicFeeRecipientsStore,
     validatorsDir: validatorsDir,
-    forkchoiceUpdatedInfo: Opt.none ForkchoiceUpdatedInformation,
     defaultFeeRecipient: defaultFeeRecipient
   )
 
@@ -121,7 +112,8 @@ proc expectBlock*(self: var ConsensusManager, expectedSlot: Slot): Future[bool] 
 
 from eth/async_utils import awaitWithTimeout
 from web3/engine_api_types import
-  ForkchoiceUpdatedResponse, PayloadExecutionStatus, PayloadStatusV1
+  ForkchoiceUpdatedResponse,
+  PayloadExecutionStatus, PayloadStatusV1, PayloadAttributesV1
 
 func `$`(h: BlockHash): string = $h.asEth2Digest
 
@@ -143,8 +135,6 @@ func shouldSyncOptimistically*(
   true
 
 func shouldSyncOptimistically*(self: ConsensusManager, wallSlot: Slot): bool =
-  if self.eth1Monitor == nil:
-    return false
   if self.optimisticHead.execution_block_hash.isZero:
     return false
 
@@ -164,62 +154,8 @@ func setOptimisticHead*(
     bid: BlockId, execution_block_hash: Eth2Digest) =
   self.optimisticHead = (bid: bid, execution_block_hash: execution_block_hash)
 
-proc runForkchoiceUpdated*(
-    eth1Monitor: Eth1Monitor,
-    headBlockRoot, safeBlockRoot, finalizedBlockRoot: Eth2Digest):
-    Future[(PayloadExecutionStatus, Option[BlockHash])] {.async.} =
-  # Allow finalizedBlockRoot to be 0 to avoid sync deadlocks.
-  #
-  # https://github.com/ethereum/EIPs/blob/master/EIPS/eip-3675.md#pos-events
-  # has "Before the first finalized block occurs in the system the finalized
-  # block hash provided by this event is stubbed with
-  # `0x0000000000000000000000000000000000000000000000000000000000000000`."
-  # and
-  # https://github.com/ethereum/consensus-specs/blob/v1.3.0-alpha.2/specs/bellatrix/validator.md#executionpayload
-  # notes "`finalized_block_hash` is the hash of the latest finalized execution
-  # payload (`Hash32()` if none yet finalized)"
-  doAssert not headBlockRoot.isZero
-
-  try:
-    # Minimize window for Eth1 monitor to shut down connection
-    await eth1Monitor.ensureDataProvider()
-
-    let fcuR = awaitWithTimeout(
-      forkchoiceUpdated(
-        eth1Monitor, headBlockRoot, safeBlockRoot, finalizedBlockRoot),
-      FORKCHOICEUPDATED_TIMEOUT):
-        debug "runForkchoiceUpdated: forkchoiceUpdated timed out"
-        ForkchoiceUpdatedResponse(
-          payloadStatus: PayloadStatusV1(
-            status: PayloadExecutionStatus.syncing))
-
-    debug "runForkchoiceUpdated: ran forkchoiceUpdated",
-      headBlockRoot, safeBlockRoot, finalizedBlockRoot,
-      payloadStatus = $fcuR.payloadStatus.status,
-      latestValidHash = $fcuR.payloadStatus.latestValidHash,
-      validationError = $fcuR.payloadStatus.validationError
-
-    return (fcuR.payloadStatus.status, fcuR.payloadStatus.latestValidHash)
-  except CatchableError as err:
-    error "runForkchoiceUpdated: forkchoiceUpdated failed",
-      err = err.msg
-    return (PayloadExecutionStatus.syncing, none BlockHash)
-
-proc runForkchoiceUpdatedDiscardResult*(
-    eth1Monitor: Eth1Monitor,
-    headBlockHash, safeBlockHash, finalizedBlockHash: Eth2Digest) {.async.} =
-  discard await eth1Monitor.runForkchoiceUpdated(
-    headBlockHash, safeBlockHash, finalizedBlockHash)
-
-from ../beacon_clock import GetBeaconTimeFn
-from ../fork_choice/fork_choice import mark_root_invalid
-
-proc updateExecutionClientHead(
-    self: ref ConsensusManager, newHead: BeaconHead):
-    Future[Opt[void]] {.async.} =
-  if self.eth1Monitor.isNil:
-    return Opt[void].ok()
-
+proc updateExecutionClientHead(self: ref ConsensusManager,
+                               newHead: BeaconHead): Future[Opt[void]] {.async.} =
   let headExecutionPayloadHash = self.dag.loadExecutionBlockRoot(newHead.blck)
 
   if headExecutionPayloadHash.isZero:
@@ -229,7 +165,7 @@ proc updateExecutionClientHead(
 
   # Can't use dag.head here because it hasn't been updated yet
   let (payloadExecutionStatus, latestValidHash) =
-    await self.eth1Monitor.runForkchoiceUpdated(
+    await self.elManager.forkchoiceUpdated(
       headExecutionPayloadHash,
       newHead.safeExecutionPayloadHash,
       newHead.finalizedExecutionPayloadHash)
@@ -361,29 +297,18 @@ proc runProposalForkchoiceUpdated*(
     return
 
   try:
-    let fcResult = awaitWithTimeout(
-      forkchoiceUpdated(
-        self.eth1Monitor,
+    let
+      safeBlockRoot = beaconHead.safeExecutionPayloadHash
+      (status, _) = await self.elManager.forkchoiceUpdated(
         headBlockRoot,
-        beaconHead.safeExecutionPayloadHash,
+        safeBlockRoot,
         beaconHead.finalizedExecutionPayloadHash,
-        timestamp, randomData, feeRecipient),
-      FORKCHOICEUPDATED_TIMEOUT):
-        debug "runProposalForkchoiceUpdated: forkchoiceUpdated timed out"
-        ForkchoiceUpdatedResponse(
-          payloadStatus: PayloadStatusV1(status: PayloadExecutionStatus.syncing))
-
-    if  fcResult.payloadStatus.status != PayloadExecutionStatus.valid or
-        fcResult.payloadId.isNone:
-      return
-
-    self.forkchoiceUpdatedInfo = Opt.some ForkchoiceUpdatedInformation(
-      payloadId: bellatrix.PayloadID(fcResult.payloadId.get),
-      headBlockRoot: headBlockRoot,
-      safeBlockRoot: beaconHead.safeExecutionPayloadHash,
-      finalizedBlockRoot: beaconHead.finalizedExecutionPayloadHash,
-      timestamp: timestamp,
-      feeRecipient: feeRecipient)
+        # TODO Use the correct PyloadAttributes type
+        payloadAttributes = some PayloadAttributesV1(
+          timestamp: Quantity timestamp,
+          prevRandao: FixedBytes[32] randomData,
+          suggestedFeeRecipient: feeRecipient))
+    debug "forkchoice updated for proposal", status
   except CatchableError as err:
     error "Engine API fork-choice update failed", err = err.msg
 

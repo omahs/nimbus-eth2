@@ -58,7 +58,7 @@ const
 proc run() {.async.} =
   let
     jwtSecret = some readJwtSecret("jwt.hex").get
-    eth1Monitor = Eth1Monitor.init(
+    elManager = newClone ELManager.init(
       defaultRuntimeConfig, db = nil, nil, @[web3Url],
       none(DepositTreeSnapshot), none(Eth1Network),
       false, jwtSecret)
@@ -69,28 +69,26 @@ proc run() {.async.} =
     Eth1Address.fromHex("0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b")
   let
     existingBlock = await web3Provider.getBlockByNumber(0)
-  await eth1Monitor.ensureDataProvider()
-  let
-    payloadId = await eth1Monitor.forkchoiceUpdated(
+    payloadId = await elManager.forkchoiceUpdated(
       existingBlock.hash.asEth2Digest,
       existingBlock.hash.asEth2Digest,
       existingBlock.timestamp.uint64 + 12,
       ZERO_HASH.data,  # Random
       feeRecipient)
-    payload =         await eth1Monitor.getPayload(
+    payload =         await elManager.getPayload(
       array[8, byte] (payloadId.payloadId.get))
-    payloadStatus =   await eth1Monitor.newPayload(payload)
-    fcupdatedStatus = await eth1Monitor.forkchoiceUpdated(
+    payloadStatus =   await elManager.sendNewPayload(payload)
+    fcupdatedStatus = await elManager.forkchoiceUpdated(
       payload.blockHash.asEth2Digest,
       payload.blockHash.asEth2Digest,
       existingBlock.timestamp.uint64 + 24,
       ZERO_HASH.data,  # Random
       feeRecipient)
 
-    payload2 =         await eth1Monitor.getPayload(
+    payload2 =         await elManager.getPayload(
       array[8, byte] (fcupdatedStatus.payloadId.get))
-    payloadStatus2 =   await eth1Monitor.newPayload(payload2)
-    fcupdatedStatus2 = await eth1Monitor.forkchoiceUpdated(
+    payloadStatus2 =   await elManager.sendNewPayload(payload2)
+    fcupdatedStatus2 = await elManager.forkchoiceUpdated(
       payload2.blockHash.asEth2Digest,
       payload2.blockHash.asEth2Digest,
       existingBlock.timestamp.uint64 + 36,

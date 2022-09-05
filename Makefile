@@ -173,7 +173,8 @@ libbacktrace:
 # - --base-rest-port + [0, --nodes)
 # - --base-metrics-port + [0, --nodes)
 # - --base-vc-metrics-port + [0, --nodes]
-# - --base-remote-signer-port + [0, --remote-signers)
+# - --base-remote-signer-port + [0, --nimbus-signer-nodes | --web3signer-nodes)
+# - --base-remote-signer-metrics-port + [0, --nimbus-signer-node | --web3signer-nodes)
 #
 # Local testnets with --run-geth or --run-nimbus (only these ports):
 # - --base-el-net-port + --el-port-offset * [0, --nodes + --light-clients)
@@ -191,25 +192,22 @@ restapi-test:
 		--resttest-delay 30 \
 		--kill-old-processes
 
-ifneq ($(shell uname -p), arm)
-TESTNET_EXTRA_FLAGS := --run-geth --dl-geth
-else
-TESTNET_EXTRA_FLAGS :=
-endif
-
 local-testnet-minimal:
 	./scripts/launch_local_testnet.sh \
 		--data-dir $@ \
 		--preset minimal \
-		--nodes 4 \
-		--stop-at-epoch 6 \
+		--nodes 2 \
+		--capella-fork-epoch 4 \
+		--stop-at-epoch 10 \
 		--disable-htop \
+		--disable-vc \
 		--enable-logtrace \
 		--base-port $$(( 6001 + EXECUTOR_NUMBER * 500 )) \
 		--base-rest-port $$(( 6031 + EXECUTOR_NUMBER * 500 )) \
 		--base-metrics-port $$(( 6061 + EXECUTOR_NUMBER * 500 )) \
 		--base-vc-metrics-port $$(( 6161 + EXECUTOR_NUMBER * 500 )) \
 		--base-remote-signer-port $$(( 6201 + EXECUTOR_NUMBER * 500 )) \
+		--base-remote-signer-metrics-port $$(( 6251 + EXECUTOR_NUMBER * 500 )) \
 		--base-el-net-port $$(( 6301 + EXECUTOR_NUMBER * 500 )) \
 		--base-el-http-port $$(( 6302 + EXECUTOR_NUMBER * 500 )) \
 		--base-el-ws-port $$(( 6303 + EXECUTOR_NUMBER * 500 )) \
@@ -217,10 +215,16 @@ local-testnet-minimal:
 		--el-port-offset 5 \
 		--timeout 648 \
 		--kill-old-processes \
-		$(TESTNET_EXTRA_FLAGS) \
+		--run-geth --dl-geth \
 		-- \
 		--verify-finalization \
 		--discv5:no
+
+#		--remote-validators-count 1024 \
+#		--enable-payload-builder \
+#		--web3signer-nodes 1 \
+#		--threshold 1 \
+#		--run-nimbus-eth1 --dl-nimbus-eth1 \
 
 local-testnet-mainnet:
 	./scripts/launch_local_testnet.sh \
@@ -229,11 +233,15 @@ local-testnet-mainnet:
 		--stop-at-epoch 6 \
 		--disable-htop \
 		--enable-logtrace \
+		--web3signer-nodes 3 \
+		--threshold 2 \
+		--remote-validators-count 100 \
 		--base-port $$(( 7001 + EXECUTOR_NUMBER * 500 )) \
 		--base-rest-port $$(( 7031 + EXECUTOR_NUMBER * 500 )) \
 		--base-metrics-port $$(( 7061 + EXECUTOR_NUMBER * 500 )) \
 		--base-vc-metrics-port $$(( 7161 + EXECUTOR_NUMBER * 500 )) \
 		--base-remote-signer-port $$(( 7201 + EXECUTOR_NUMBER * 500 )) \
+		--base-remote-signer-metrics-port $$(( 7251 + EXECUTOR_NUMBER * 500 )) \
 		--base-el-net-port $$(( 7301 + EXECUTOR_NUMBER * 500 )) \
 		--base-el-http-port $$(( 7302 + EXECUTOR_NUMBER * 500 )) \
 		--base-el-ws-port $$(( 7303 + EXECUTOR_NUMBER * 500 )) \
@@ -241,7 +249,8 @@ local-testnet-mainnet:
 		--el-port-offset 5 \
 		--timeout 2784 \
 		--kill-old-processes \
-		$(TESTNET_EXTRA_FLAGS) \
+		--run-geth --dl-geth \
+		--run-nimbus-eth1 --dl-nimbus-eth1 \
 		-- \
 		--verify-finalization \
 		--discv5:no
