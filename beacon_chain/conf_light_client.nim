@@ -127,11 +127,15 @@ type LightClientConf* = object
   # Execution layer
   web3Urls* {.
     desc: "One or more execution layer Web3 provider URLs"
-    name: "web3-url" .}: seq[string]
+    name: "web3-url" .}: seq[EngineApiUrlConfigValue]
+
+  elUrls* {.
+    desc: "One or more Execution Layer Engine API URLs"
+    name: "el" .}: seq[EngineApiUrlConfigValue]
 
   jwtSecret* {.
     desc: "A file containing the hex-encoded 256 bit secret key to be used for verifying/generating JWT tokens"
-    name: "jwt-secret" .}: Option[string]
+    name: "jwt-secret" .}: Option[InputFile]
 
   # Testing
   stopAtEpoch* {.
@@ -145,3 +149,6 @@ template loadJwtSecret*(
     config: LightClientConf,
     allowCreate: bool): Option[seq[byte]] =
   rng.loadJwtSecret(string(config.dataDir), config.jwtSecret, allowCreate)
+
+proc engineApiUrls*(config: LightClientConf): seq[EngineApiUrl] =
+  (config.elUrls & config.web3Urls).toFinalEngineApiUrls(config.jwtSecret)

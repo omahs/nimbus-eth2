@@ -246,12 +246,12 @@ proc initFullNode(
       # This `nimcall` functions helps for keeping track of what
       # needs to be captured by the onFinalization closure.
       eventBus: EventBus,
-      eth1Monitor: Eth1Monitor): OnFinalizedCallback {.nimcall.} =
-    static: doAssert (eth1Monitor is ref)
+      elManager: ELManager): OnFinalizedCallback {.nimcall.} =
+    static: doAssert (elManager is ref)
     return proc(dag: ChainDAGRef, data: FinalizationInfoObject) =
-      if eth1Monitor != nil:
+      if elManager != nil:
         let finalizedEpochRef = dag.getFinalizedEpochRef()
-        discard trackFinalizedState(eth1Monitor,
+        discard trackFinalizedState(elManager,
                                     finalizedEpochRef.eth1_data,
                                     finalizedEpochRef.eth1_deposit_index)
       node.updateLightClientFromDag()
@@ -294,7 +294,7 @@ proc initFullNode(
     exitPool = newClone(
       ExitPool.init(dag, attestationPool, onVoluntaryExitAdded))
     consensusManager = ConsensusManager.new(
-      dag, attestationPool, quarantine, node.eth1Monitor,
+      dag, attestationPool, quarantine, node.elManager,
       ActionTracker.init(rng, config.subscribeAllSubnets),
       node.dynamicFeeRecipientsStore, config.validatorsDir,
       config.defaultFeeRecipient)
@@ -343,7 +343,7 @@ proc initFullNode(
 
     router.onSyncCommitteeMessage = scheduleSendingLightClientUpdates
 
-  dag.setFinalizationCb makeOnFinalizationCb(node.eventBus, node.eth1Monitor)
+  dag.setFinalizationCb makeOnFinalizationCb(node.eventBus, node.elManager)
   dag.setBlockCb(onBlockAdded)
   dag.setHeadCb(onHeadChanged)
   dag.setReorgCb(onChainReorg)
@@ -448,16 +448,15 @@ proc init*(T: type BeaconNode,
   else:
     nil
 
-  let optJwtSecret = rng[].loadJwtSecret(config, allowCreate = false)
+  let engineApiUrls = config.engineApiUrls
 
-  if config.web3Urls.len() == 0:
+  if engineApiUrls.len == 0:
     if cfg.BELLATRIX_FORK_EPOCH == FAR_FUTURE_EPOCH:
       notice "Running without execution client - validator features partially disabled (see https://nimbus.guide/eth1.html)"
     else:
       notice "Running without execution client - validator features disabled (see https://nimbus.guide/eth1.html)"
 
-  var eth1Monitor: Eth1Monitor
-
+  var genesisDetectionElManager: ELManager
   var genesisState =
     if metadata.genesisData.len > 0:
       try:
@@ -475,25 +474,22 @@ proc init*(T: type BeaconNode,
         # This is a fresh start without a known genesis state
         # (most likely, it hasn't arrived yet). We'll try to
         # obtain a genesis through the Eth1 deposits monitor:
-        if config.web3Urls.len == 0:
+        if engineApiUrls.len == 0:
           fatal "Web3 URL not specified"
           quit 1
 
         # TODO Could move this to a separate "GenesisMonitor" process or task
         #      that would do only this - see Paul's proposal for this.
-        let eth1Monitor = Eth1Monitor.init(
+        genesisDetectionElManager = ELManager.new(
           cfg,
           db,
           nil,
-          config.web3Urls,
-          eth1Network,
-          config.web3ForcePolling,
-          optJwtSecret,
-          ttdReached = false)
+          engineApiUrls,
+          eth1Network)
 
-        eth1Monitor.loadPersistedDeposits()
+        elManager.loadPersistedDeposits()
 
-        let phase0Genesis = waitFor eth1Monitor.waitGenesis()
+        let phase0Genesis = waitFor elManager.waitGenesis()
         genesisState = (ref ForkedHashedBeaconState)(
           kind: BeaconStateFork.Phase0,
           phase0Data:
@@ -575,22 +571,22 @@ proc init*(T: type BeaconNode,
     dag.checkWeakSubjectivityCheckpoint(
       config.weakSubjectivityCheckpoint.get, beaconClock)
 
-  if eth1Monitor.isNil and config.web3Urls.len > 0:
-    waitFor Eth1Monitor.runDbMigrations(
-      db,
-      config.web3Urls[0],
-      optJwtSecret,
-      cfg.DEPOSIT_CONTRACT_ADDRESS,
-      metadata.depositContractDeployedAt)
+  waitFor ELManager.runDbMigrations(
+    db,
+    config.web3Urls[0],
+    optJwtSecret,
+    cfg.DEPOSIT_CONTRACT_ADDRESS,
+    metadata.depositContractDeployedAt)
 
-    eth1Monitor = Eth1Monitor.init(
+  let elManager = if genesisDetectionElManager != nil:
+    genesisDetectionElManager
+  else:
+    ELManager.new(
       cfg,
       db,
       getBeaconTime,
-      config.web3Urls,
+      engineApiUrls,
       eth1Network,
-      config.web3ForcePolling,
-      optJwtSecret,
       ttdReached = not dag.loadExecutionBlockRoot(dag.finalizedHead.blck).isZero)
 
   if config.rpcEnabled.isSome:
@@ -674,7 +670,7 @@ proc init*(T: type BeaconNode,
     db: db,
     config: config,
     attachedValidators: validatorPool,
-    eth1Monitor: eth1Monitor,
+    elManager: elManager,
     payloadBuilderRestClient: payloadBuilderRestClient,
     restServer: restServer,
     keymanagerHost: keymanagerHost,
@@ -685,13 +681,6 @@ proc init*(T: type BeaconNode,
     beaconClock: beaconClock,
     validatorMonitor: validatorMonitor,
     stateTtlCache: stateTtlCache,
-    nextExchangeTransitionConfTime:
-      # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.1/src/engine/specification.md#specification-3
-      # Consensus Layer client software **SHOULD** poll this endpoint every
-      # 60 seconds.
-      # Delay first call by that time to allow for EL syncing to begin; it can
-      # otherwise generate an EL warning by claiming a zero merge block.
-      Moment.now + chronos.seconds(60),
     dynamicFeeRecipientsStore: newClone(DynamicFeeRecipientsStore.init()))
 
   node.initLightClient(
@@ -1318,17 +1307,6 @@ proc onSecond(node: BeaconNode, time: Moment) =
   # Nim GC metrics (for the main thread)
   updateThreadMetrics()
 
-  if time >= node.nextExchangeTransitionConfTime and not node.eth1Monitor.isNil:
-    # The EL client SHOULD log a warning when not receiving an exchange message
-    # at least once every 120 seconds. If we only attempt to exchange every 60
-    # seconds, the warning would be triggered if a single message is missed.
-    # To accommodate for that, exchange slightly more frequently.
-    # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.1/src/engine/specification.md#engine_exchangetransitionconfigurationv1
-    node.nextExchangeTransitionConfTime = time + chronos.seconds(45)
-
-    if node.currentSlot.epoch >= node.dag.cfg.BELLATRIX_FORK_EPOCH:
-      traceAsyncErrors node.eth1Monitor.exchangeTransitionConfiguration()
-
   if node.config.stopAtSyncedEpoch != 0 and
       node.dag.head.slot.epoch >= node.config.stopAtSyncedEpoch:
     notice "Shutting down after having reached the target synced epoch"
@@ -1605,11 +1583,7 @@ proc start*(node: BeaconNode) {.raises: [Defect, CatchableError].} =
 
   waitFor node.initializeNetworking()
 
-  if node.eth1Monitor != nil:
-    node.eth1Monitor.start()
-  else:
-    notice "Running without execution chain monitor, block producation partially disabled"
-
+  node.elManager.start()
   node.run()
 
 func formatGwei(amount: uint64): string =
@@ -1821,9 +1795,10 @@ proc doCreateTestnet*(config: BeaconNodeConf, rng: var HmacDrbgContext) {.raises
   let
     startTime = uint64(times.toUnix(times.getTime()) + config.genesisOffset)
     outGenesis = config.outputGenesis.string
-    eth1Hash = if config.web3Urls.len == 0: eth1BlockHash
+    engineApiUrls = config.engineApiUrls
+    eth1Hash = if engineApiUrls.len == 0: eth1BlockHash
                else: (waitFor getEth1BlockHash(
-                 config.web3Urls[0], blockId("latest"),
+                 engineApiUrls[0], blockId("latest"),
                  rng.loadJwtSecret(config, allowCreate = true))).asEth2Digest
     cfg = getRuntimeConfig(config.eth2Network)
   var

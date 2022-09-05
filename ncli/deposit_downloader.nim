@@ -1,22 +1,23 @@
 import
-  json, strutils,
+  std/[json, strutils, times, sequtils],
   chronos, confutils, chronicles,
   web3, web3/ethtypes as web3Types,
   eth/async_utils,
+  ../beacon_chain/beacon_chain_db,
   ../beacon_chain/networking/network_metadata,
   ../beacon_chain/eth1/eth1_monitor,
-  ../beacon_chain/spec/helpers
+  ../beacon_chain/spec/[presets, helpers]
 
 type
   CliFlags = object
     web3Url {.
-      name: "web3-url".}: string
+      name: "web3-url".}: seq[string]
     depositContractAddress {.
       name: "deposit-contract".}: string
     startBlock {.
       name: "start-block".}: uint64
     endBlock {.
-      name: "start-block".}: Option[uint64]
+      name: "end-block".}: Option[uint64]
     outDepositsFile {.
       defaultValue: "deposits.csv"
       name: "out-deposits-file".}: OutFile
@@ -40,12 +41,26 @@ const
   web3Timeouts = 60.seconds
 
 proc main(flags: CliFlags) {.async.} =
+  let
+    db = BeaconChainDB.new("", inMemory = true)
+    cfg = defaultRuntimeConfig
+    beaconTimeFn = proc(): BeaconTime = getTime()
+    
+  let elManager = ELManager.init(
+    cfg, db, beaconTimeFn,
+    mapIt(flags.web3Urls, EngineApiUrl(url: it)),
+    none DepositContractSnapshot,
+    eth1Netowkr = some mainnet,
+    jwtSecret = none seq[byte],
+    requireEngineAPI = false)
+    
   let web3 = waitFor newWeb3(flags.web3Url)
 
   let endBlock = if flags.endBlock.isSome:
     flags.endBlock.get
   else:
-    awaitWithRetries(web3.provider.eth_getBlockByNumber(blockId"latest", false)).number.uint64
+    awaitWithRetries(web3.provider.eth_getBlockByNumber(blockId"latest", false),
+                     web3RequestsTimeout).number.uint64
 
   let depositContract = web3.contractSender(
     DepositContract,
@@ -120,7 +135,8 @@ proc main(flags: CliFlags) {.async.} =
           offset += decode(depositData, offset, index)
 
           let txHash = TxHash.fromHex txNode.str
-          let tx = awaitWithRetries web3.provider.eth_getTransactionByHash(txHash)
+          let tx = awaitWithRetries(web3.provider.eth_getTransactionByHash(txHash),
+                                    web3RequestsTimeout)
 
           depositsFile.write(
             $blockNum, ",",

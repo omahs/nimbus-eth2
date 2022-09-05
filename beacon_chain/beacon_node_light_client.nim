@@ -11,14 +11,12 @@ else:
   {.push raises: [].}
 
 import
-  chronicles,
+  chronicles, web3/engine_api_types,
   ./beacon_node
 
 logScope: topics = "beacnde"
 
 func shouldSyncOptimistically*(node: BeaconNode, wallSlot: Slot): bool =
-  if node.eth1Monitor == nil:
-    return false
   let optimisticHeader = node.lightClient.optimisticHeader.valueOr:
     return false
 
@@ -42,7 +40,7 @@ proc initLightClient*(
 
   let
     optimisticHandler = proc(signedBlock: ForkedMsgTrustedSignedBeaconBlock):
-        Future[void] {.async.} =
+                             Future[void] {.async.} =
       info "New LC optimistic block",
         opt = signedBlock.toBlockId(),
         dag = node.dag.head.bid,
@@ -52,10 +50,9 @@ proc initLightClient*(
           if blck.message.is_execution_block:
             template payload(): auto = blck.message.body.execution_payload
 
-            let eth1Monitor = node.eth1Monitor
-            if eth1Monitor != nil and not payload.block_hash.isZero:
+            if not payload.block_hash.isZero:
               # engine_newPayloadV1
-              discard await eth1Monitor.newExecutionPayload(payload)
+              discard await node.elManager.newExecutionPayload(payload)
 
               # Retain optimistic head for other `forkchoiceUpdated` callers.
               # May temporarily block `forkchoiceUpdatedV1` calls, e.g., Geth:
@@ -68,10 +65,12 @@ proc initLightClient*(
 
               # engine_forkchoiceUpdatedV1
               let beaconHead = node.attestationPool[].getBeaconHead(nil)
-              discard await eth1Monitor.runForkchoiceUpdated(
-                headBlockRoot = payload.block_hash,
-                safeBlockRoot = beaconHead.safeExecutionPayloadHash,
-                finalizedBlockRoot = beaconHead.finalizedExecutionPayloadHash)
+              discard await node.elManager.forkchoiceUpdated(
+                headBlock = payload.block_hash,
+                safeBlock = beaconHead.safeExecutionPayloadHash,
+                finalizedBlock = beaconHead.finalizedExecutionPayloadHash,
+                # The light client doesn't intend to produce new blocks
+                payloadAttributes = none PayloadAttributesV1)
           else: discard
 
     optimisticProcessor = initOptimisticProcessor(
