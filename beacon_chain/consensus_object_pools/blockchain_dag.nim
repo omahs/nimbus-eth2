@@ -61,7 +61,12 @@ proc putBlock*(
 
 proc updateState*(
     dag: ChainDAGRef, state: var ForkedHashedBeaconState, bsi: BlockSlotId,
-    save: bool, cache: var StateCache): bool {.gcsafe.}
+    save: bool, cache: var StateCache, callerInfo: tuple[filename: string, line: int, column: int]): bool {.gcsafe.}
+
+template updateState*(
+    dag: ChainDAGRef, state: var ForkedHashedBeaconState, bsi: BlockSlotId,
+    save: bool, cache: var StateCache): bool =
+  updateState(dag, state, bsi, save, cache, instantiationInfo())
 
 template withUpdatedState*(
     dag: ChainDAGRef, stateParam: var ForkedHashedBeaconState,
@@ -265,6 +270,55 @@ func atSlot*(dag: ChainDAGRef, bid: BlockId, slot: Slot): Opt[BlockSlotId] =
   else:
     dag.getBlockIdAtSlot(slot)
 
+func nextTimestamp[I, T](cache: var LRUCache[I, T]): uint32 =
+  if cache.timestamp == uint32.high:
+    for i in 0 ..< I:
+      template e: untyped = cache.entries[i]
+      if e.lastUsed != 0:
+        e.lastUsed = 1
+    cache.timestamp = 1
+  inc cache.timestamp
+  cache.timestamp
+
+template findIt[I, T](cache: var LRUCache[I, T], predicate: untyped): Opt[T] =
+  block:
+    var res: Opt[T]
+    for i in 0 ..< I:
+      template e: untyped = cache.entries[i]
+      template it: untyped {.inject, used.} = e.value
+      if e.lastUsed != 0 and predicate:
+        e.lastUsed = cache.nextTimestamp
+        res.ok it
+        break
+    res
+
+template delIt[I, T](cache: var LRUCache[I, T], predicate: untyped) =
+  block:
+    for i in 0 ..< I:
+      template e: untyped = cache.entries[i]
+      template it: untyped {.inject, used.} = e.value
+      if e.lastUsed != 0 and predicate:
+        e.reset()
+
+func put[I, T](cache: var LRUCache[I, T], value: T) =
+  var lru = 0
+  block:
+    var min = uint32.high
+    for i in 0 ..< I:
+      template e: untyped = cache.entries[i]
+      if e.lastUsed < min:
+        min = e.lastUsed
+        lru = i
+        if min == 0:
+          break
+    if min != 0:
+      {.noSideEffect.}:
+        info "Cache full - evicting LRU", cache = typeof(T).name, capacity = I
+
+  template e: untyped = cache.entries[lru]
+  e.value = value
+  e.lastUsed = cache.nextTimestamp
+
 func epochAncestor*(dag: ChainDAGRef, bid: BlockId, epoch: Epoch): EpochKey =
   ## The state transition works by storing information from blocks in a
   ## "working" area until the epoch transition, then batching work collected
@@ -296,11 +350,8 @@ func findShufflingRef*(
     dependent_bsi = dag.atSlot(bid, dependent_slot).valueOr:
       return Opt.none(ShufflingRef)
 
-  for s in dag.shufflingRefs:
-    if s == nil: continue
-    if s.epoch == epoch and dependent_bsi.bid.root == s.attester_dependent_root:
-      return Opt.some s
-  Opt.none(ShufflingRef)
+  dag.shufflingRefs.findIt(
+    it.epoch == epoch and dependent_bsi.bid.root == it.attester_dependent_root)
 
 func putShufflingRef*(dag: ChainDAGRef, shufflingRef: ShufflingRef) =
   ## Store shuffling in the cache
@@ -309,20 +360,17 @@ func putShufflingRef*(dag: ChainDAGRef, shufflingRef: ShufflingRef) =
     # are seldomly used (ie RPC), so no need to cache
     return
 
-  # Because we put a cap on the number of shufflingRef we store, we want to
-  # prune the least useful state - for now, we'll assume that to be the
-  # oldest shufflingRef we know about.
-  var
-    oldest = 0
-  for x in 0..<dag.shufflingRefs.len:
-    let candidate = dag.shufflingRefs[x]
-    if candidate == nil:
-      oldest = x
-      break
-    if candidate.epoch < dag.shufflingRefs[oldest].epoch:
-      oldest = x
+  dag.shufflingRefs.put shufflingRef
 
-  dag.shufflingRefs[oldest] = shufflingRef
+  func key(it: ShufflingRef): string =
+    $it.epoch & ":" & shortLog(it.attester_dependent_root)
+
+  {.noSideEffect.}:
+    var entries: seq[string]
+    for i in 0 ..< dag.shufflingRefs.I:
+      if dag.shufflingRefs.entries[i].lastUsed != 0:
+        entries.add $i & ">" & $(dag.shufflingRefs.entries[i].value.key)
+    info "Done putting shufflingRef", key = shufflingRef.key, entries
 
 func findEpochRef*(
     dag: ChainDAGRef, bid: BlockId, epoch: Epoch): Opt[EpochRef] =
@@ -330,12 +378,7 @@ func findEpochRef*(
   ## `getEpochRef` for a version that creates a new instance if it's missing
   let ancestor = dag.epochAncestor(bid, epoch)
 
-  for e in dag.epochRefs:
-    if e == nil: continue
-    if e.key == ancestor:
-      return Opt.some e
-
-  Opt.none(EpochRef)
+  result = dag.epochRefs.findIt(it.key == ancestor)
 
 func putEpochRef(dag: ChainDAGRef, epochRef: EpochRef) =
   if epochRef.epoch < dag.finalizedHead.slot.epoch():
@@ -343,21 +386,14 @@ func putEpochRef(dag: ChainDAGRef, epochRef: EpochRef) =
     # are seldomly used (ie RPC), so no need to cache
     return
 
-  # Because we put a cap on the number of epochRefs we store, we want to
-  # prune the least useful state - for now, we'll assume that to be the
-  # oldest epochRef we know about.
+  dag.epochRefs.put epochRef
 
-  var
-    oldest = 0
-  for x in 0..<dag.epochRefs.len:
-    let candidate = dag.epochRefs[x]
-    if candidate == nil:
-      oldest = x
-      break
-    if candidate.key.epoch < dag.epochRefs[oldest].epoch:
-      oldest = x
-
-  dag.epochRefs[oldest] = epochRef
+  {.noSideEffect.}:
+    var entries: seq[string]
+    for i in 0 ..< dag.epochRefs.I:
+      if dag.epochRefs.entries[i].lastUsed != 0:
+        entries.add $i & ">" & $shortLog(dag.epochRefs.entries[i].value.key)
+    info "Done putting epochRef", key = epochRef.key, entries
 
 func init*(
     T: type ShufflingRef, state: ForkedHashedBeaconState,
@@ -1077,7 +1113,7 @@ func getEpochRef*(
 
 proc getEpochRef*(
     dag: ChainDAGRef, bid: BlockId, epoch: Epoch,
-    preFinalized: bool): Opt[EpochRef] =
+    preFinalized: bool, callerInfo: tuple[filename: string, line: int, column: int]): Opt[EpochRef] =
   ## Return a cached EpochRef or construct one from the database, if possible -
   ## returns `none` on failure.
   ##
@@ -1116,15 +1152,25 @@ proc getEpochRef*(
   var cache: StateCache
   if not updateState(
       dag, dag.epochRefState, ? dag.atSlot(ancestor.bid, epoch.start_slot),
-      false, cache):
+      false, cache, callerInfo):
     return err()
 
-  ok(dag.getEpochRef(dag.epochRefState, cache))
+  result = ok(dag.getEpochRef(dag.epochRefState, cache))
+
+template getEpochRef*(
+    dag: ChainDAGRef, bid: BlockId, epoch: Epoch,
+    preFinalized: bool): Opt[EpochRef] =
+  getEpochRef(dag, bid, epoch, preFinalized, instantiationInfo())
 
 proc getEpochRef*(
     dag: ChainDAGRef, blck: BlockRef, epoch: Epoch,
+    preFinalized: bool, callerInfo: tuple[filename: string, line: int, column: int]): Opt[EpochRef] =
+  dag.getEpochRef(blck.bid, epoch, preFinalized, callerInfo)
+
+template getEpochRef*(
+    dag: ChainDAGRef, blck: BlockRef, epoch: Epoch,
     preFinalized: bool): Opt[EpochRef] =
-  dag.getEpochRef(blck.bid, epoch, preFinalized)
+  getEpochRef(dag, blck, epoch, preFinalized, instantiationInfo())
 
 proc getFinalizedEpochRef*(dag: ChainDAGRef): EpochRef =
   dag.getEpochRef(
@@ -1133,7 +1179,7 @@ proc getFinalizedEpochRef*(dag: ChainDAGRef): EpochRef =
 
 proc getShufflingRef*(
     dag: ChainDAGRef, blck: BlockRef, epoch: Epoch,
-    preFinalized: bool): Opt[ShufflingRef] =
+    preFinalized: bool, callerInfo: tuple[filename: string, line: int, column: int]): Opt[ShufflingRef] =
   ## Return the shuffling in the given history and epoch - this potentially is
   ## faster than returning a full EpochRef because the shuffling is determined
   ## an epoch in advance and therefore is less sensitive to reorgs
@@ -1142,12 +1188,17 @@ proc getShufflingRef*(
     # TODO here, we could check the existing cached states and see if any one
     # has the right dependent root - unlike EpochRef, we don't need an _exact_
     # epoch match
-    let epochRef = dag.getEpochRef(blck, epoch, preFinalized).valueOr:
+    let epochRef = dag.getEpochRef(blck, epoch, preFinalized, callerInfo).valueOr:
       return Opt.none ShufflingRef
     dag.putShufflingRef(epochRef.shufflingRef)
     Opt.some epochRef.shufflingRef
   else:
     shufflingRef
+
+template getShufflingRef*(
+    dag: ChainDAGRef, blck: BlockRef, epoch: Epoch,
+    preFinalized: bool): Opt[ShufflingRef] =
+  getShufflingRef(dag, blck, epoch, preFinalized, instantiationInfo())
 
 func stateCheckpoint*(dag: ChainDAGRef, bsi: BlockSlotId): BlockSlotId =
   ## The first ancestor BlockSlot that is a state checkpoint
@@ -1224,7 +1275,7 @@ proc getBlockRange*(
 
 proc updateState*(
     dag: ChainDAGRef, state: var ForkedHashedBeaconState, bsi: BlockSlotId,
-    save: bool, cache: var StateCache): bool =
+    save: bool, cache: var StateCache, callerInfo: tuple[filename: string, line: int, column: int]): bool =
   ## Rewind or advance state such that it matches the given block and slot -
   ## this may include replaying from an earlier snapshot if blck is on a
   ## different branch or has advanced to a higher slot number than slot
@@ -1405,7 +1456,8 @@ proc updateState*(
       targetStateRoot = shortLog(getStateRoot(state)),
       found,
       assignDur,
-      replayDur
+      replayDur,
+      callerInfo
   elif ancestors.len > 0:
     debug "State replayed",
       blocks = ancestors.len,
@@ -1417,7 +1469,8 @@ proc updateState*(
       targetStateRoot = shortLog(getStateRoot(state)),
       found,
       assignDur,
-      replayDur
+      replayDur,
+      callerInfo
   else: # Normal case!
     trace "State advanced",
       blocks = ancestors.len,
@@ -1429,7 +1482,8 @@ proc updateState*(
       targetStateRoot = shortLog(getStateRoot(state)),
       found,
       assignDur,
-      replayDur
+      replayDur,
+      callerInfo
 
   true
 
@@ -1675,14 +1729,9 @@ proc pruneStateCachesDAG*(dag: ChainDAGRef) =
   block: # Clean up old EpochRef instances
     # After finalization, we can clear up the epoch cache and save memory -
     # it will be recomputed if needed
-    for i in 0..<dag.epochRefs.len:
-      if dag.epochRefs[i] != nil and
-          dag.epochRefs[i].epoch < dag.finalizedHead.slot.epoch:
-        dag.epochRefs[i] = nil
-    for i in 0..<dag.shufflingRefs.len:
-      if dag.shufflingRefs[i] != nil and
-          dag.shufflingRefs[i].epoch < dag.finalizedHead.slot.epoch:
-        dag.shufflingRefs[i] = nil
+    info "Pruning epoch and shuffling refs", minEpoch = dag.finalizedHead.slot.epoch
+    dag.epochRefs.delIt(it.epoch < dag.finalizedHead.slot.epoch)
+    dag.shufflingRefs.delIt(it.epoch < dag.finalizedHead.slot.epoch)
 
   let epochRefPruneTick = Moment.now()
 
@@ -2006,10 +2055,10 @@ proc preInit*(
         validators = forkyState.data.validators.len()
 
 proc getProposer*(
-    dag: ChainDAGRef, head: BlockRef, slot: Slot): Option[ValidatorIndex] =
+    dag: ChainDAGRef, head: BlockRef, slot: Slot, callerInfo: tuple[filename: string, line: int, column: int]): Option[ValidatorIndex] =
   let
     epochRef = block:
-      let tmp = dag.getEpochRef(head.bid, slot.epoch(), false)
+      let tmp = dag.getEpochRef(head.bid, slot.epoch(), false, callerInfo)
       if tmp.isErr():
         return none(ValidatorIndex)
       tmp.get()
@@ -2026,6 +2075,10 @@ proc getProposer*(
       return none(ValidatorIndex)
 
   proposer
+
+template getProposer*(
+    dag: ChainDAGRef, head: BlockRef, slot: Slot): Option[ValidatorIndex] =
+  getProposer(dag, head, slot, instantiationInfo())
 
 proc aggregateAll*(
   dag: ChainDAGRef,
