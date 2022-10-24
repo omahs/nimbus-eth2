@@ -769,15 +769,20 @@ proc readChunkPayload*(conn: Connection, peer: Peer,
     except LPStreamEOFError: #, LPStreamIncompleteError, InvalidVarintError
       # TODO compiler error - haha, uncaught exception
       # Error: unhandled exception: closureiters.nim(322, 17) `c[i].kind == nkType`  [AssertionError]
+      warn "##### readChunkPayload LPStreamEOF"
       return neterr UnexpectedEOF
     except LPStreamIncompleteError:
+      warn "##### readChunkPayload LPStreamIncomplete"
       return neterr UnexpectedEOF
     except InvalidVarintError:
+      warn "##### readChunkPayload InvalidVarint"
       return neterr UnexpectedEOF
 
   if size > maxChunkSize:
+    warn "##### readChunkPayload SizePrefixOverflow"
     return neterr SizePrefixOverflow
   if size == 0:
+    warn "##### readChunkPayload ZeroSizePrefix"
     return neterr ZeroSizePrefix
 
   # The `size.int` conversion is safe because `size` is bounded to `MAX_CHUNK_SIZE`
@@ -789,7 +794,7 @@ proc readChunkPayload*(conn: Connection, peer: Peer,
                               uint64(10 + size))
     return ok SSZ.decode(data.get(), MsgType)
   else:
-    debug "Snappy decompression/read failed", msg = $data.error, conn
+    warn "##### Snappy decompression/read failed", msg = $data.error, conn
     return neterr InvalidSnappyBytes
 
 proc readResponseChunk(conn: Connection, peer: Peer, maxChunkSize: uint32,
@@ -801,6 +806,7 @@ proc readResponseChunk(conn: Connection, peer: Peer, maxChunkSize: uint32,
     try:
       await conn.readExactly(addr responseCodeByte, 1)
     except LPStreamEOFError, LPStreamIncompleteError:
+      warn "##### readResponseChunk PotentiallyExpectedEOF"
       return neterr PotentiallyExpectedEOF
 
     static: assert ResponseCode.low.ord == 0
@@ -816,7 +822,7 @@ proc readResponseChunk(conn: Connection, peer: Peer, maxChunkSize: uint32,
         errorMsg = if errorMsgChunk.isOk: errorMsgChunk.value
                    else: return err(errorMsgChunk.error)
         errorMsgStr = toPrettyString(errorMsg.asSeq)
-      debug "Error response from peer", responseCode, errMsg = errorMsgStr
+      warn "##### Error response from peer", responseCode, errMsg = errorMsgStr
       return err Eth2NetworkingError(kind: ReceivedErrorResponse,
                                      responseCode: responseCode,
                                      errorMsg: errorMsgStr)
@@ -826,6 +832,7 @@ proc readResponseChunk(conn: Connection, peer: Peer, maxChunkSize: uint32,
     return await readChunkPayload(conn, peer, maxChunkSize, MsgType)
 
   except LPStreamEOFError, LPStreamIncompleteError:
+    warn "##### readResponseChunk UnexpectedEOF"
     return neterr UnexpectedEOF
 
 proc readResponse(conn: Connection, peer: Peer, maxChunkSize: uint32,
@@ -849,7 +856,7 @@ proc readResponse(conn: Connection, peer: Peer, maxChunkSize: uint32,
           trace "EOF chunk", conn, err = nextRes.error
 
           return ok results
-        trace "Error chunk", conn, err = nextRes.error
+        warn "##### Error chunk", conn, err = nextRes.error
 
         return err nextRes.error
       else:
@@ -858,6 +865,7 @@ proc readResponse(conn: Connection, peer: Peer, maxChunkSize: uint32,
   else:
     let nextFut = conn.readResponseChunk(peer, maxChunkSize, MsgType)
     if not await nextFut.withTimeout(timeout):
+      warn "##### readResponse Timeout"
       return neterr(ReadResponseTimeout)
     return nextFut.read()
 
