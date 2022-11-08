@@ -62,7 +62,7 @@ programMain:
       if config.web3Urls.len > 0:
         let res = Eth1Monitor.init(
           cfg, db = nil, getBeaconTime, config.web3Urls,
-          none(DepositContractSnapshot), metadata.eth1Network,
+          metadata.eth1Network,
           forcePolling = false,
           rng[].loadJwtSecret(config, allowCreate = false),
           # TTD is not relevant for the light client, so it's safe

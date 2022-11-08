@@ -10,13 +10,20 @@ else:
   {.push raises: [].}
 
 import
-  stew/base10,
-  chronicles, chronos,
+  stew/[base10, results],
+  chronicles, chronos, eth/async_utils,
   ./sync/sync_manager,
   ./consensus_object_pools/blockchain_dag,
   ./spec/eth2_apis/rest_beacon_client,
-  ./spec/[beaconstate, eth2_merkleization, forks, presets, state_transition],
+  ./spec/[beaconstate,
+          deposit_snapshots,
+          eth2_merkleization,
+          forks,
+          presets,
+          state_transition],
   "."/[beacon_clock, beacon_chain_db]
+
+from presto import RestDecodingError
 
 type
   DbCache = object
@@ -64,6 +71,30 @@ proc update(cache: var DbCache, blck: ForkySignedBeaconBlock) =
 proc isKnown(cache: DbCache, slot: Slot): bool =
   slot < cache.slots.lenu64 and cache.slots[slot.int].isSome()
 
+const
+  restRequestsTimeout = 5.seconds
+
+proc fetchDepositSnapshot(client: RestClientRef):
+                          Future[Result[DepositTreeSnapshot, string]] {.async.} =
+  let resp = try:
+    awaitWithTimeout(client.getDepositSnapshot(), restRequestsTimeout):
+      return err "Fetching deposit tree snapshot timed out"
+  except CatchableError as e:
+    return err(e.msg)
+
+  let data = resp.data.data
+  let snapshot = DepositTreeSnapshot(
+    eth1Block: data.execution_block_hash,
+    depositContractState: DepositContractState(
+      branch: data.finalized,
+      deposit_count: depositCountBytes(data.deposit_count)),
+    blockHeight: data.execution_block_height)
+
+  if not snapshot.isValid(data.deposit_root):
+    return err "Corrupted deposit snapshot"
+
+  return ok snapshot
+
 proc doTrustedNodeSync*(
     cfg: RuntimeConfig, databaseDir: string, restUrl: string,
     stateId: string, backfill: bool, reindex: bool,
@@ -109,7 +140,9 @@ proc doTrustedNodeSync*(
     var lastError: ref CatchableError
     for i in 0..<3:
       try:
-        return await client.getBlockV2(BlockIdent.init(slot), cfg)
+        return awaitWithTimeout(client.getBlockV2(BlockIdent.init(slot), cfg),
+                                restRequestsTimeout):
+          raise newException(CatchableError, "Request timed out")
       except RestResponseError as exc:
         lastError = exc
         notice "Server does not support block downloads / backfilling",
@@ -158,8 +191,11 @@ proc doTrustedNodeSync*(
       else:
         notice "Downloading genesis state", restUrl
         try:
-          await client.getStateV2(
-            StateIdent.init(StateIdentType.Genesis), cfg)
+          awaitWithTimeout(
+              client.getStateV2(StateIdent.init(StateIdentType.Genesis), cfg),
+              restRequestsTimeout):
+            info "Attempt to download genesis state timed out"
+            nil
         except CatchableError as exc:
           info "Unable to download genesis state",
             error = exc.msg, restUrl
@@ -184,7 +220,9 @@ proc doTrustedNodeSync*(
             StateIdent.init(tmp.slot.epoch().start_slot)
           else:
             tmp
-        await client.getStateV2(id, cfg)
+        awaitWithTimeout(client.getStateV2(id, cfg), restRequestsTimeout):
+          error "Attempt to download checkpoint state timed out"
+          quit 1
       except CatchableError as exc:
         error "Unable to download checkpoint state",
           error = exc.msg
@@ -228,6 +266,16 @@ proc doTrustedNodeSync*(
     notice "Skipping checkpoint download, database already exists (remove db directory to get a fresh snapshot)",
       databaseDir, head = shortLog(dbHead.get())
     (headSlot, dbHead.get())
+
+  # Fetch deposit snapshot.  This API endpoint is still optional.
+  let depositSnapshot = await fetchDepositSnapshot(client)
+  if depositSnapshot.isOk:
+    info "Writing deposit contracts snapshot",
+         depositRoot = depositSnapshot.get.getDepositRoot,
+         depositCount = depositSnapshot.get.getDepositCountU64
+    db.putDepositTreeSnapshot(depositSnapshot.get)
+  else:
+    info "Trusted node has no deposits snapshot"
 
   # Coming this far, we've done what ChainDAGRef.preInit would normally do -
   # Let's do a sanity check and start backfilling blocks from the trusted node
