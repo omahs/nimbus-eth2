@@ -52,29 +52,55 @@ pipeline {
       } }
     }
 
-    stage('Build') {
-      steps { timeout(40) {
-        sh 'make LOG_LEVEL=TRACE'
-      } }
-    }
-
-    stage('Tests') {
-      parallel {
-        stage('General') {
-          steps { timeout(60) {
-            sh 'make DISABLE_TEST_FIXTURES_SCRIPT=1 test'
-          } }
+    stage('Finalizations 1') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal')
+          } } }
         }
 
-        stage('REST') {
-          steps { timeout(5) {
-            sh 'make restapi-test'
-          } }
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet')
+          } } }
         }
       }
     }
 
-    stage('Finalizations') {
+    stage('Finalizations 2') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet')
+          } } }
+        }
+      }
+    }
+
+    stage('Finalizations 3') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet')
+          } } }
+        }
+      }
+    }
+
+    stage('Finalizations 4') {
       stages {  /* parallel builds of minimal / mainnet not yet supported */
         stage('minimal') {
           steps { script { timeout(26) {
