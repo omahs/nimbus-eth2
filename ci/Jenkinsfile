@@ -143,7 +143,7 @@ def launchLocalTestnet(String name) {
     sh "make local-testnet-${name}"
   }
   /* Archive test results regardless of outcome. */
-  sh "tar cjf local-testnet-${name}.tar.gz local-testnet-${name}/*.txt"
+  sh "tar cjf local-testnet-${name}.tar.gz local-testnet-${name}/*.txt *.paths"
 }
 
 def isMainBranch() {
