@@ -805,8 +805,11 @@ proc readResponseChunk(conn: Connection, peer: Peer, maxChunkSize: uint32,
     var responseCodeByte: byte
     try:
       await conn.readExactly(addr responseCodeByte, 1)
-    except LPStreamEOFError, LPStreamIncompleteError:
-      warn "##### readResponseChunk PotentiallyExpectedEOF"
+    except LPStreamEOFError:
+      warn "##### readResponseChunk LPStreamEOFError"
+      return neterr PotentiallyExpectedEOF
+    except LPStreamIncompleteError:
+      warn "##### readResponseChunk LPStreamIncompleteError"
       return neterr PotentiallyExpectedEOF
 
     static: assert ResponseCode.low.ord == 0
@@ -879,24 +882,34 @@ proc makeEth2Request(peer: Peer, protocolId: string, requestBytes: Bytes,
                      ResponseMsg: type,
                      timeout: Duration): Future[NetRes[ResponseMsg]]
                     {.async.} =
+  warn "##### makeEth2Request start", peer, protocolId, timeout
   var deadline = sleepAsync timeout
 
   let stream = awaitWithTimeout(peer.network.openStream(peer, protocolId),
-                                deadline): return neterr StreamOpenTimeout
+                                deadline):
+    warn "##### makeEth2Request StreamOpenTimeout", peer, protocolId, timeout
+    return neterr StreamOpenTimeout
   try:
     # Send the request
     # Some clients don't want a length sent for empty requests
     # So don't send anything on empty requests
     if requestBytes.len > 0:
+      warn "##### makeEth2Request writing code", peer, protocolId, timeout
       await stream.writeChunk(none ResponseCode, requestBytes)
     # Half-close the stream to mark the end of the request - if this is not
     # done, the other peer might never send us the response.
+    warn "##### makeEth2Request closing stream", peer, protocolId, timeout
     await stream.close()
 
     # Read the response
+    warn "##### makeEth2Request reading response", peer, protocolId, timeout
     return await readResponse(
       stream, peer, maxChunkSize(ResponseMsg), ResponseMsg, timeout)
+  except CatchableError as exc:
+    warn "##### makeEth2Request Exception", peer, protocolId, timeout, e = exc.msg
+    return neterr InvalidResponseCode
   finally:
+    warn "##### makeEth2Request closing with eof", peer, protocolId, timeout
     await stream.closeWithEOF()
 
 proc init*[MsgType](T: type MultipleChunksResponse[MsgType],

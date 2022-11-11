@@ -137,6 +137,7 @@ proc doRequest(
     startPeriod = periods.a
     lastPeriod = periods.b
     reqCount = min(periods.len, MAX_REQUEST_LIGHT_CLIENT_UPDATES).uint64
+  warn "##### LC sending range query", peer
   let response = await peer.lightClientUpdatesByRange(startPeriod, reqCount)
   if response.isOk:
     if response.get.lenu64 > reqCount:
@@ -213,7 +214,9 @@ proc workerTask[E](
     peer: Peer
     didProgress = false
   try:
+    warn "##### LC Acquiring peer"
     peer = self.network.peerPool.acquireNoWait()
+    warn "##### LC Doing request"
     let value =
       when E.K is Nothing:
         await E.doRequest(peer)
@@ -222,6 +225,7 @@ proc workerTask[E](
     if value.isOk:
       var applyReward = false
       for val in value.get.values:
+        warn "##### LC verifying value"
         let res = await self.valueVerifier(E)(val)
         if res.isErr:
           case res.error
@@ -256,6 +260,7 @@ proc workerTask[E](
       peer.updateScore(PeerScoreNoBlocks)
       debug "Failed to receive value on request", value,
         endpoint = E.name, peer, peer_score = peer.getScore()
+    warn "##### LC work no exception"
   except ResponseError as exc:
     warn "Received invalid response", error = exc.msg,
       endpoint = E.name, peer, peer_score = peer.getScore()
@@ -272,7 +277,9 @@ proc workerTask[E](
     raise exc
   finally:
     if peer != nil:
+      warn "##### LC releasing peer"
       self.network.peerPool.release(peer)
+  warn "##### LC work done", didProgress
   return didProgress
 
 proc query[E](
@@ -327,6 +334,7 @@ proc query[E](
           doneFut.complete()
         break
       if not workers[i].finished:
+        warn "##### LC Cancelling worker", i
         workers[i].cancel()
     while true:
       try:
@@ -343,6 +351,8 @@ proc query[E](
 
   if not progressFut.finished:
     progressFut.cancel()
+
+  warn "##### LC query done", completed = progressFut.completed
   return progressFut.completed
 
 template query(
