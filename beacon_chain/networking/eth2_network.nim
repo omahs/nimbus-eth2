@@ -903,11 +903,10 @@ proc makeEth2Request(peer: Peer, protocolId: string, requestBytes: Bytes,
 
     # Read the response
     warn "##### makeEth2Request reading response", peer, protocolId, timeout
-    return await readResponse(
+    let r = await readResponse(
       stream, peer, maxChunkSize(ResponseMsg), ResponseMsg, timeout)
-  except CatchableError as exc:
-    warn "##### makeEth2Request Exception", peer, protocolId, timeout, e = exc.msg
-    return neterr InvalidResponseCode
+    warn "##### makeEth2Request OK", peer, protocolId, timeout
+    return r
   finally:
     warn "##### makeEth2Request closing with eof", peer, protocolId, timeout
     await stream.closeWithEOF()

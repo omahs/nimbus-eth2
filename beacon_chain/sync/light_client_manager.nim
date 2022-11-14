@@ -266,6 +266,8 @@ proc workerTask[E](
       endpoint = E.name, peer, peer_score = peer.getScore()
     peer.updateScore(PeerScoreBadBlocks)
   except CancelledError as exc:
+    warn "##### LC work CancelledError", error = exc.msg,
+      endpoint = E.name, peer, peer_score = peer.getScore()
     raise exc
   except PeerPoolError as exc:
     debug "Failed to acquire peer", exc = exc.msg

@@ -132,6 +132,22 @@ pipeline {
       }
     }
 
+    stage('Finalizations 6') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal', '6')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet', '6')
+          } } }
+        }
+      }
+    }
+
     stage('Upload') {
       steps { timeout(5) {
         archiveArtifacts('*.tar.gz')
