@@ -34,6 +34,7 @@ for GETH_NUM_NODE in $(seq 0 $(( GETH_NUM_NODES - 1 ))); do
             break
         fi
         if (( ++GETH_RETRY >= 300 )); then
+            ls -al "${GETHDATADIR}"
             echo "Geth failed to start"
             exit 1
         fi
