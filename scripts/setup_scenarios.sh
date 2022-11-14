@@ -9,6 +9,8 @@
 
 set -e
 
+export V=1
+
 SUBREPO_DIR="vendor/nim-eth2-scenarios"
 # verbosity level
 [[ -z "$V" ]] && V=0
