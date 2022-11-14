@@ -22,7 +22,7 @@
 	path = vendor/nimbus-build-system
 	url = https://github.com/status-im/nimbus-build-system.git
 	ignore = untracked
-	branch = master
+	branch = dev/etan/y
 [submodule "vendor/NimYAML"]
 	path = vendor/NimYAML
 	url = https://github.com/status-im/NimYAML.git
