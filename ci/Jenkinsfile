@@ -167,15 +167,11 @@ pipeline {
 
 def launchLocalTestnet(String name, String n) {
   /* We want to mark job as failed, but save the results. */
-  catchError(
-    message: "Local ${name} testnet finalization failure!",
-    buildResult: 'FAILURE',
-    stageResult: 'FAILURE'
-  ) {
+  try {
     sh "make local-testnet-${name}"
+  } finally {
+    sh "tar cjf local-testnet-${name}-${n}.tar.gz local-testnet-${name}/*.txt *.paths"
   }
-  /* Archive test results regardless of outcome. */
-  sh "tar cjf local-testnet-${name}-${n}.tar.gz local-testnet-${name}/*.txt *.paths"
 }
 
 def isMainBranch() {
