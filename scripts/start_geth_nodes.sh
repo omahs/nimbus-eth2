@@ -29,8 +29,8 @@ for GETH_NUM_NODE in $(seq 0 $(( GETH_NUM_NODES - 1 ))); do
     ${GETH_BINARY} --http --ws --http.corsdomain '*' --http.api "eth,net,engine" -ws.api "eth,net,engine" --datadir "${GETHDATADIR}" ${DISCOVER} --port ${GETH_NET_PORT} --http.port ${GETH_HTTP_PORT} --ws.port ${GETH_WS_PORT} --authrpc.port ${GETH_AUTH_RPC_PORT} --authrpc.jwtsecret "${GETHDATADIR}/jwtsecret" &> "${DATA_DIR}/geth-log${GETH_NUM_NODE}.txt" &
     GETH_RETRY=0
     while :; do
-        if [[ -f "${GETHDATADIR}/geth.ipc" ]]; then
-            echo "Geth started in $(( GETH_RETRY / 10.0 ))s"
+        if [[ -S "${GETHDATADIR}/geth.ipc" ]]; then
+            echo "Geth ${GETH_NUM_NODE} started in $(( GETH_RETRY * 100 ))ms"
             break
         fi
         if (( ++GETH_RETRY >= 300 )); then
