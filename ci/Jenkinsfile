@@ -148,6 +148,38 @@ pipeline {
       }
     }
 
+    stage('Finalizations 7') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal', '7')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet', '7')
+          } } }
+        }
+      }
+    }
+
+    stage('Finalizations 8') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal', '8')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet', '8')
+          } } }
+        }
+      }
+    }
+
     stage('Upload') {
       steps { timeout(5) {
         archiveArtifacts('*.tar.gz')
