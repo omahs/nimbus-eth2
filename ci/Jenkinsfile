@@ -170,7 +170,7 @@ def launchLocalTestnet(String name, String n) {
   try {
     sh "make local-testnet-${name}"
   } finally {
-    sh "tar cjf local-testnet-${name}-${n}.tar.gz local-testnet-${name}/*.txt *.paths"
+    sh "tar cjf local-testnet-${name}-${n}.tar.gz local-testnet-${name}/*.txt"
   }
 }
 
