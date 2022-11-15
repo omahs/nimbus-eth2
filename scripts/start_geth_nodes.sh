@@ -34,7 +34,7 @@ for GETH_NUM_NODE in $(seq 0 $(( GETH_NUM_NODES - 1 ))); do
             break
         fi
         if (( ++GETH_RETRY >= 300 )); then
-            echo "Geth failed to start"
+            echo "Geth ${GETH_NUM_NODE} failed to start"
             exit 1
         fi
         sleep 0.1
