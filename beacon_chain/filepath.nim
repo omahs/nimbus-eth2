@@ -74,6 +74,7 @@ proc secureCreatePath*(path: string): IoResult[void] =
       err(sres.error)
     else:
       var sd = sres.get()
+      error "#### sres ok"
       createPath(path, 0o700, secDescriptor = sd.getDescriptor())
   else:
     createPath(path, 0o700)
