@@ -179,16 +179,13 @@ pipeline {
         }
       }
     }
-
-    stage('Upload') {
-      steps { timeout(5) {
-        archiveArtifacts('*.tar.gz')
-      } }
-    }
   }
 
   post {
     always {
+      catchError { timeout(5) {
+        archiveArtifacts('*.tar.gz', allowEmptyArchive: true)
+      } }
       cleanWs(
         disableDeferredWipeout: true,
         deleteDirs: true
