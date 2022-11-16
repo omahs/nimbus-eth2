@@ -184,7 +184,7 @@ pipeline {
   post {
     always {
       catchError { timeout(5) {
-        archiveArtifacts('*.tar.gz', allowEmptyArchive: true)
+        archiveArtifacts(artifacts: '*.tar.gz', allowEmptyArchive: true)
       } }
       cleanWs(
         disableDeferredWipeout: true,
