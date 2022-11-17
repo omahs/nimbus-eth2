@@ -1061,7 +1061,7 @@ proc handleIncomingStream(network: Eth2Node,
       NetRes[MsgRec].ok default(MsgRec)
     else:
       try:
-        debug "reading message", peer = peer, msgName, deadline
+        debug "reading message", peer = peer, msgName
         awaitWithTimeout(
           readChunkPayload(conn, peer, maxChunkSize(MsgRec), MsgRec), deadline):
             # Timeout, e.g., cancellation due to fulfillment by different peer.
