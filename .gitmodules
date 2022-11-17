@@ -187,7 +187,7 @@
 	path = vendor/nim-presto
 	url = https://github.com/status-im/nim-presto.git
 	ignore = untracked
-	branch = master
+	branch = dev/etan/y
 [submodule "vendor/eth2-networks"]
 	path = vendor/eth2-networks
 	url = https://github.com/eth-clients/eth2-networks.git

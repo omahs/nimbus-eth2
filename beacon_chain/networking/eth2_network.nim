@@ -324,11 +324,12 @@ proc openStream(node: Eth2Node,
   # When dialling here, we do not provide addresses - all new connection
   # attempts are handled via `connect` which also takes into account
   # reconnection timeouts
+  debug "openStream start", peer, protocolId
   let
     protocolId = protocolId & "ssz_snappy"
     conn = await dial(
       node.switch, peer.peerId, protocolId)
-
+  debug "openStream done", peer, protocolId
   return conn
 
 proc init(T: type Peer, network: Eth2Node, peerId: PeerId): Peer {.gcsafe.}
@@ -600,6 +601,9 @@ proc writeChunk(conn: Connection,
     compressFramed(payload, output)
   except IOError as exc:
     raiseAssert exc.msg # memoryOutput shouldn't raise
+
+  debug "writeChunk", conn, responseCode, contextBytes,
+    payload = shortLog(payload)
   conn.write(output.getOutput)
 
 template errorMsgLit(x: static string): ErrorMsg =
@@ -806,10 +810,10 @@ proc readResponseChunk(conn: Connection, peer: Peer, maxChunkSize: uint32,
     try:
       await conn.readExactly(addr responseCodeByte, 1)
     except LPStreamEOFError:
-      warn "##### readResponseChunk LPStreamEOFError"
+      warn "##### readResponseChunk LPStreamEOFError", peer
       return neterr PotentiallyExpectedEOF
     except LPStreamIncompleteError:
-      warn "##### readResponseChunk LPStreamIncompleteError"
+      warn "##### readResponseChunk LPStreamIncompleteError", peer
       return neterr PotentiallyExpectedEOF
 
     static: assert ResponseCode.low.ord == 0
@@ -1022,18 +1026,22 @@ proc handleIncomingStream(network: Eth2Node,
       debug "Got incoming request from peer", peer = peer, msgName
 
     template returnInvalidRequest(msg: ErrorMsg) =
+      debug "returnInvalidRequest", peer = peer, msgName, msg
       peer.updateScore(PeerScoreInvalidRequest)
       await sendErrorResponse(peer, conn, InvalidRequest, msg)
       return
 
     template returnInvalidRequest(msg: string) =
+      debug "returnInvalidRequest", peer = peer, msgName, msg
       returnInvalidRequest(ErrorMsg msg.toBytes)
 
     template returnResourceUnavailable(msg: ErrorMsg) =
+      debug "returnResourceUnavailable", peer = peer, msgName, msg
       await sendErrorResponse(peer, conn, ResourceUnavailable, msg)
       return
 
     template returnResourceUnavailable(msg: string) =
+      debug "returnResourceUnavailable", peer = peer, msgName, msg
       returnResourceUnavailable(ErrorMsg msg.toBytes)
 
     # TODO(zah) The TTFB timeout is not implemented in LibP2P streams back-end
@@ -1053,6 +1061,7 @@ proc handleIncomingStream(network: Eth2Node,
       NetRes[MsgRec].ok default(MsgRec)
     else:
       try:
+        debug "reading message", peer = peer, msgName, deadline
         awaitWithTimeout(
           readChunkPayload(conn, peer, maxChunkSize(MsgRec), MsgRec), deadline):
             # Timeout, e.g., cancellation due to fulfillment by different peer.
@@ -1102,7 +1111,9 @@ proc handleIncomingStream(network: Eth2Node,
       return
 
     try:
+      debug "logReceivedMsg", peer = peer, msgName
       logReceivedMsg(peer, MsgType(msg.get))
+      debug "callUserHandler", peer = peer, msgName
       await callUserHandler(MsgType, peer, conn, msg.get)
     except InvalidInputsError as err:
       returnInvalidRequest err.msg
@@ -1116,8 +1127,11 @@ proc handleIncomingStream(network: Eth2Node,
     debug "Error processing an incoming request", err = err.msg, msgName
 
   finally:
+    debug "closeWithEOF", peer = peer, msgName
     await conn.closeWithEOF()
+    debug "checkPeerScore", peer = peer, msgName
     discard network.peerPool.checkPeerScore(peer)
+    debug "handleIncomingStream DONE", peer = peer, msgName
 
 proc toPeerAddr*(r: enr.TypedRecord,
                  proto: IpTransportProtocol): Result[PeerAddr, cstring] =

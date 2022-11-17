@@ -338,6 +338,7 @@ proc query[E](
       if not workers[i].finished:
         warn "##### LC Cancelling worker", i
         workers[i].cancel()
+        warn "##### LC Cancelled worker", i
     while true:
       try:
         await allFutures(workers[0 ..< maxCompleted])

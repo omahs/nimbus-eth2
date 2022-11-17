@@ -580,7 +580,7 @@ p2pProtocol BeaconSync(version = 1,
       response: MultipleChunksResponse[altair.LightClientUpdate])
       {.async, libp2pProtocol("light_client_updates_by_range", 1,
                               isLightClientRequest = true).} =
-    trace "Received LC updates by range request", peer, startPeriod, reqCount
+    debug "Received LC updates by range request", peer, startPeriod, reqCount
     let dag = peer.networkState.dag
     doAssert dag.lcDataStore.serve
 
