@@ -1026,22 +1026,22 @@ proc handleIncomingStream(network: Eth2Node,
       debug "Got incoming request from peer", peer = peer, msgName
 
     template returnInvalidRequest(msg: ErrorMsg) =
-      debug "returnInvalidRequest", peer = peer, msgName, msg
+      debug "returnInvalidRequest", peer = peer, msgName, msg = msg
       peer.updateScore(PeerScoreInvalidRequest)
       await sendErrorResponse(peer, conn, InvalidRequest, msg)
       return
 
     template returnInvalidRequest(msg: string) =
-      debug "returnInvalidRequest", peer = peer, msgName, msg
+      debug "returnInvalidRequest", peer = peer, msgName, msg = msg
       returnInvalidRequest(ErrorMsg msg.toBytes)
 
     template returnResourceUnavailable(msg: ErrorMsg) =
-      debug "returnResourceUnavailable", peer = peer, msgName, msg
+      debug "returnResourceUnavailable", peer = peer, msgName, msg = msg
       await sendErrorResponse(peer, conn, ResourceUnavailable, msg)
       return
 
     template returnResourceUnavailable(msg: string) =
-      debug "returnResourceUnavailable", peer = peer, msgName, msg
+      debug "returnResourceUnavailable", peer = peer, msgName, msg = msg
       returnResourceUnavailable(ErrorMsg msg.toBytes)
 
     # TODO(zah) The TTFB timeout is not implemented in LibP2P streams back-end
