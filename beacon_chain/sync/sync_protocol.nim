@@ -22,7 +22,7 @@ import
   ../rpc/rest_constants
 
 logScope:
-  topics = "sync"
+  topics = "lcsync"
 
 const
   MAX_REQUEST_BLOCKS = 1024
