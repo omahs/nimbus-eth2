@@ -291,6 +291,86 @@ pipeline {
         }
       }
     }
+
+    stage('Finalizations 16') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal', '16')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet', '16')
+          } } }
+        }
+      }
+    }
+
+    stage('Finalizations 17') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal', '17')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet', '17')
+          } } }
+        }
+      }
+    }
+
+    stage('Finalizations 18') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal', '18')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet', '18')
+          } } }
+        }
+      }
+    }
+
+    stage('Finalizations 19') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal', '19')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet', '19')
+          } } }
+        }
+      }
+    }
+
+    stage('Finalizations 20') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal', '20')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet', '20')
+          } } }
+        }
+      }
+    }
   }
 
   post {
