@@ -860,7 +860,7 @@ proc readResponse(conn: Connection, peer: Peer, maxChunkSize: uint32,
       let nextRes = nextFut.read()
       if nextRes.isErr:
         if nextRes.error.kind == PotentiallyExpectedEOF:
-          trace "EOF chunk", conn, err = nextRes.error
+          debug "EOF chunk", conn, err = nextRes.error
 
           return ok results
         warn "##### Error chunk", conn, err = nextRes.error
