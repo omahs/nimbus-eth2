@@ -867,7 +867,7 @@ proc readResponse(conn: Connection, peer: Peer, maxChunkSize: uint32,
 
         return err nextRes.error
       else:
-        trace "Got chunk", conn
+        debug "Got chunk", conn
         results.add nextRes.value
   else:
     let nextFut = conn.readResponseChunk(peer, maxChunkSize, MsgType)
