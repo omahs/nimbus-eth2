@@ -14,7 +14,7 @@ pipeline {
     timestamps()
     ansiColor('xterm')
     /* This also includes wait time in the queue. */
-    timeout(time: 24, unit: 'HOURS')
+    timeout(time: 30, unit: 'HOURS')
     /* Limit builds retained. */
     buildDiscarder(logRotator(
       numToKeepStr: '5',
@@ -367,6 +367,86 @@ pipeline {
         stage('mainnet') {
           steps { script { timeout(62) {
             launchLocalTestnet('mainnet', '20')
+          } } }
+        }
+      }
+    }
+
+    stage('Finalizations 21') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal', '21')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet', '21')
+          } } }
+        }
+      }
+    }
+
+    stage('Finalizations 22') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal', '22')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet', '22')
+          } } }
+        }
+      }
+    }
+
+    stage('Finalizations 23') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal', '23')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet', '23')
+          } } }
+        }
+      }
+    }
+
+    stage('Finalizations 24') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal', '24')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet', '24')
+          } } }
+        }
+      }
+    }
+
+    stage('Finalizations 25') {
+      stages {  /* parallel builds of minimal / mainnet not yet supported */
+        stage('minimal') {
+          steps { script { timeout(26) {
+            launchLocalTestnet('minimal', '25')
+          } } }
+        }
+
+        stage('mainnet') {
+          steps { script { timeout(62) {
+            launchLocalTestnet('mainnet', '25')
           } } }
         }
       }
