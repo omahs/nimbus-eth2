@@ -279,7 +279,8 @@ proc workerTask[E](
     raise exc
   finally:
     if peer != nil:
-      warn "##### LC releasing peer"
+      warn "##### LC releasing peer",
+        endpoint = E.name, peer, peer_score = peer.getScore()
       self.network.peerPool.release(peer)
   warn "##### LC work done", didProgress
   return didProgress

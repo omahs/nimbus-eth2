@@ -808,6 +808,7 @@ proc readResponseChunk(conn: Connection, peer: Peer, maxChunkSize: uint32,
   try:
     var responseCodeByte: byte
     try:
+      debug "##### readResponseChunk readExactly", peer, conn
       await conn.readExactly(addr responseCodeByte, 1)
     except LPStreamEOFError:
       warn "##### readResponseChunk LPStreamEOFError", peer
@@ -836,6 +837,7 @@ proc readResponseChunk(conn: Connection, peer: Peer, maxChunkSize: uint32,
     of Success:
       discard
 
+    debug "##### readResponseChunk readChunkPayload", peer, conn, maxChunkkSize
     return await readChunkPayload(conn, peer, maxChunkSize, MsgType)
 
   except LPStreamEOFError, LPStreamIncompleteError:
@@ -853,7 +855,7 @@ proc readResponse(conn: Connection, peer: Peer, maxChunkSize: uint32,
       # timeout would allow, so we allow each chunk a new timeout instead.
       # The problem is exacerbated by the large number of round-trips to the
       # poll loop that each future along the way causes.
-      trace "reading chunk", conn
+      debug "reading chunk", conn
       let nextFut = conn.readResponseChunk(peer, maxChunkSize, E)
       if not await nextFut.withTimeout(timeout):
         return neterr(ReadResponseTimeout)
