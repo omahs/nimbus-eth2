@@ -837,7 +837,7 @@ proc readResponseChunk(conn: Connection, peer: Peer, maxChunkSize: uint32,
     of Success:
       discard
 
-    debug "##### readResponseChunk readChunkPayload", peer, conn, maxChunkkSize
+    debug "##### readResponseChunk readChunkPayload", peer, conn, maxChunkSize
     return await readChunkPayload(conn, peer, maxChunkSize, MsgType)
 
   except LPStreamEOFError, LPStreamIncompleteError:
