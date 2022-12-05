@@ -1116,7 +1116,10 @@ if [[ "$USE_HTOP" == "1" ]]; then
 else
   FAILED=0
   for PID in $(echo "$PIDS" | tr ',' ' '); do
-    wait "$PID" || FAILED="$(( FAILED += 1 ))"
+    wait "$PID" || {
+      echo "$PID failed ($PIDS)";
+      FAILED="$(( FAILED += 1 ))";
+    }
   done
   if [[ "$FAILED" != "0" ]]; then
     echo "${FAILED} child processes had non-zero exit codes (or exited early)."
