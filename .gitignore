@@ -45,6 +45,7 @@ build/
 
 /local_testnet_data*/
 /local_testnet*_data*/
+/local-testnet-*/
 
 test_keymanager_api
 
