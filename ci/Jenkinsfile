@@ -52,29 +52,6 @@ pipeline {
       } }
     }
 
-    stage('Build') {
-      steps { timeout(40) {
-        sh 'make LOG_LEVEL=TRACE'
-      } }
-    }
-
-    stage('Tests') {
-      parallel {
-        stage('General') {
-          steps { timeout(60) {
-            sh 'make DISABLE_TEST_FIXTURES_SCRIPT=1 test'
-            sh 'git diff --exit-code'  /* Check no uncommitted changes. */
-          } }
-        }
-
-        stage('REST') {
-          steps { timeout(5) {
-            sh 'make restapi-test'
-          } }
-        }
-      }
-    }
-
     stage('Finalizations') {
       stages {  /* parallel builds of minimal / mainnet not yet supported */
         stage('minimal') {
@@ -107,6 +84,9 @@ pipeline {
         disableDeferredWipeout: true,
         deleteDirs: true
       )
+      success { script {
+        build(job: env.JOB_NAME, propagate: false, wait: false)
+      } }
     }
   }
 }
