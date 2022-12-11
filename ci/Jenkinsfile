@@ -84,10 +84,10 @@ pipeline {
         disableDeferredWipeout: true,
         deleteDirs: true
       )
-      success { script {
-        build(job: env.JOB_NAME, propagate: false, wait: false)
-      } }
     }
+    success { script {
+      build(job: env.JOB_NAME, propagate: false, wait: false)
+    } }
   }
 }
 
