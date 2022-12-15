@@ -2258,6 +2258,7 @@ proc newBeaconSwitch(config: BeaconNodeConf | LightClientConf,
     .withAddress(address)
     .withRng(rng)
     .withNoise()
+    .withYamux()
     .withMplex(chronos.minutes(5), chronos.minutes(5))
     .withMaxConnections(config.maxPeers)
     .withAgentVersion(config.agentString)
