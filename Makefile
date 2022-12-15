@@ -200,6 +200,7 @@ endif
 local-testnet-minimal:
 	./scripts/launch_local_testnet.sh \
 		--data-dir $@ \
+		--log-level TRACE \
 		--preset minimal \
 		--nodes 4 \
 		--stop-at-epoch 6 \
@@ -225,6 +226,7 @@ local-testnet-minimal:
 local-testnet-mainnet:
 	./scripts/launch_local_testnet.sh \
 		--data-dir $@ \
+		--log-level TRACE \
 		--nodes 4 \
 		--stop-at-epoch 6 \
 		--disable-htop \
