@@ -185,6 +185,10 @@ proc loadChainDag(
             dataDir = config.dataDir
       quit 1
 
+  # The first pruning after restart may take a while..
+  if config.historyMode == HistoryMode.Prune:
+    dag.pruneHistory(true)
+
   dag
 
 proc checkWeakSubjectivityCheckpoint(
@@ -1115,6 +1119,9 @@ proc onSlotEnd(node: BeaconNode, slot: Slot) {.async.} =
   # ----
   # This is the last pruning to do as it clears the "needPruning" condition.
   node.consensusManager[].pruneStateCachesAndForkChoice()
+
+  if node.config.historyMode == HistoryMode.Prune:
+    node.dag.pruneHistory()
 
   when declared(GC_fullCollect):
     # The slots in the beacon node work as frames in a game: we want to make
